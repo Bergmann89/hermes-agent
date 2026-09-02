@@ -155,3 +155,139 @@ class TestChildDelegatedLease:
         assert session["active_session_lease"] is sentinel
         assert sentinel.session_id == "new-key"
 
+
+class TestCloseInterruptsActiveChildTurn:
+    """Explicit session.close must interrupt an in-flight compute-host child
+    turn BEFORE releasing the serving process's real lease.
+
+    With the sentinel installed, the child's ownership chokepoint is a total
+    no-op, so safety rests on the serving process holding the real lease for the
+    whole child turn. The automatic reapers already gate on ``running`` (which
+    the serving process holds True from dispatch until the child reports done),
+    but explicit ``session.close`` tears down unconditionally and only waited on
+    the in-process ``_run_thread`` -- absent for an isolated turn. Without an
+    interrupt the lease drops while the child keeps writing, reopening a narrow
+    #94778 window for a sibling backend sharing HERMES_HOME.
+    """
+
+    def _base_session(self):
+        return {
+            "agent": None,
+            "session_key": "session-key",
+            "history": [],
+            "history_lock": threading.Lock(),
+            "history_version": 0,
+            "running": True,
+            "_compute_host_active": True,
+            "attached_images": [],
+            "image_counter": 0,
+            "cols": 80,
+            "slash_worker": None,
+            "show_reasoning": False,
+            "tool_progress_mode": "all",
+        }
+
+    def test_close_interrupts_child_before_releasing_lease(self, monkeypatch):
+        order = []
+        session_ref = {}
+
+        class _Supervisor:
+            def interrupt(self, sid, request_id=None):
+                order.append("interrupt")
+                # A real child reports the turn done, which clears `running`.
+                session_ref["session"]["running"] = False
+                return True
+
+        monkeypatch.setattr(
+            server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor()
+        )
+        monkeypatch.setattr(
+            server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}}
+        )
+        monkeypatch.setattr(
+            server, "_session_uses_compute_host", lambda session, cfg=None: True
+        )
+
+        # A real release records its ordering relative to the interrupt.
+        real_release = server._release_active_session_slot
+
+        def _tracked_release(session):
+            order.append("release")
+            return real_release(session)
+
+        monkeypatch.setattr(server, "_release_active_session_slot", _tracked_release)
+
+        session = self._base_session()
+        session_ref["session"] = session
+        # A delegated sentinel stands in for the handed-off admission.
+        server._install_delegated_active_session_lease(
+            session, {"active_session_admitted": True, "session_key": "session-key"}
+        )
+        session["_sid"] = "sid"
+
+        server._teardown_popped_session(session, end_reason="tui_close")
+
+        assert "interrupt" in order, "child turn was not interrupted on close"
+        assert order.index("interrupt") < order.index("release"), (
+            "lease released before the child turn was interrupted"
+        )
+
+    def test_close_wait_is_bounded_when_child_never_settles(self, monkeypatch):
+        # If the child never reports done, close must not hang forever: the
+        # settle wait is bounded and teardown proceeds (with a warning).
+        class _Supervisor:
+            def interrupt(self, sid, request_id=None):
+                return True  # never clears `running`
+
+        monkeypatch.setattr(
+            server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor()
+        )
+        monkeypatch.setattr(
+            server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}}
+        )
+        monkeypatch.setattr(
+            server, "_session_uses_compute_host", lambda session, cfg=None: True
+        )
+        # Shrink the grace so the test stays fast.
+        monkeypatch.setattr(server, "_TURN_SETTLE_BEFORE_CLOSE_SECONDS", 0.1)
+
+        session = self._base_session()
+        server._install_delegated_active_session_lease(
+            session, {"active_session_admitted": True, "session_key": "session-key"}
+        )
+        session["_sid"] = "sid"
+
+        import time as _time
+
+        start = _time.monotonic()
+        assert server._teardown_popped_session(session, end_reason="tui_close") is True
+        elapsed = _time.monotonic() - start
+        assert elapsed < 2.0, "close hung past the bounded settle grace"
+        # Lease still gets released (teardown proceeds despite the stuck child).
+        assert session.get("active_session_lease") is None
+
+    def test_close_without_active_child_turn_does_not_interrupt(self, monkeypatch):
+        calls = {"interrupt": 0}
+
+        class _Supervisor:
+            def interrupt(self, sid, request_id=None):
+                calls["interrupt"] += 1
+                return True
+
+        monkeypatch.setattr(
+            server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor()
+        )
+        monkeypatch.setattr(
+            server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}}
+        )
+        monkeypatch.setattr(
+            server, "_session_uses_compute_host", lambda session, cfg=None: True
+        )
+
+        session = self._base_session()
+        session["running"] = False
+        session["_compute_host_active"] = False
+        session["_sid"] = "sid"
+
+        server._teardown_popped_session(session, end_reason="tui_close")
+        assert calls["interrupt"] == 0
