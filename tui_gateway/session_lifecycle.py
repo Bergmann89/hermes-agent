@@ -363,6 +363,38 @@ def _teardown_popped_session(session: dict | None, *, end_reason: str = "tui_clo
     """Finish a close after the caller has atomically detached the session."""
     if session is None:
         return False
+    # An isolated (compute-host) turn runs in a CHILD process, not in this
+    # process's _run_thread, so the settle-grace join below cannot see it. Its
+    # safety while running rests entirely on this serving process holding the
+    # real active-session lease (the child's own ownership chokepoint is a
+    # no-op via the delegated sentinel). _finalize_session releases that lease
+    # unconditionally, so interrupt the child FIRST -- otherwise the lease
+    # drops while the child keeps writing, reopening a narrow #94778 window for
+    # a sibling backend sharing HERMES_HOME. The automatic reapers already gate
+    # on `running`, so this only matters for an explicit close mid-turn.
+    if (
+        end_reason != "tui_shutdown"
+        and (session.get("running") or session.get("_compute_host_active"))
+        and _session_uses_compute_host(session)
+    ):
+        try:
+            _interrupt_session_turn(str(session.get("_sid") or ""), session)
+            # interrupt() is fire-and-forget (it just sends a frame to the
+            # child), so wait -- bounded by the same settle grace the in-process
+            # path uses for _run_thread -- for the child to report the turn done
+            # (_on_compute_host_turn_done clears `running`). This keeps the real
+            # lease held until the child actually stops writing, not merely until
+            # the interrupt was dispatched.
+            deadline = time.monotonic() + _TURN_SETTLE_BEFORE_CLOSE_SECONDS
+            while session.get("running") and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if session.get("running"):
+                logger.warning(
+                    "compute-host turn still running after %.1fs close grace",
+                    _TURN_SETTLE_BEFORE_CLOSE_SECONDS,
+                )
+        except Exception:
+            logger.debug("failed to interrupt compute-host turn on close", exc_info=True)
     run_thread = session.get("_run_thread")
     if end_reason != "tui_shutdown" and run_thread is not None and run_thread is not threading.current_thread():
         try:
