@@ -269,6 +269,9 @@ class ComputeHost:
             session = self._build_server_session(server, frame, sid)
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
+        # Re-adopt the serving process's admission on every reused turn
+        # (Design 1) -- the lease sentinel is per-turn frame state.
+        server._install_delegated_active_session_lease(session, frame)
         return session
 
     def _build_server_session(self, server: Any, frame: dict[str, Any], sid: str) -> dict:

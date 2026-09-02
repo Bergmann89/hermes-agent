@@ -57,6 +57,44 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return limit_message
 
 
+def _install_delegated_active_session_lease(session: dict, frame: dict) -> None:
+    """Install a disabled sentinel lease for a turn admitted by the serving process.
+
+    Turn-isolation Design 1: a named-profile turn is admitted ONCE, in the
+    serving (dashboard/gateway) process, which claims the real active-session
+    lease. The turn is then dispatched to a compute-host child, whose rebuilt
+    session dict carries no lease. The child re-crosses the ownership chokepoint
+    in ``_run_prompt_submit`` (the #94778 double-writer guard) and would
+    otherwise re-claim -- and be refused, because ``_is_same_writer`` cannot
+    match across a process boundary (it requires an equal pid).
+
+    When the frame says the turn was already admitted, install a DISABLED
+    ``ActiveSessionLease`` so ``_ensure_active_session_slot`` short-circuits on
+    the ``active_session_lease is not None`` fast path -- no second registry
+    claim. The lease is disabled (``enabled=False``), so ``release()`` is a
+    no-op and ``transfer_active_session`` (fired when auto-compression rotates
+    the session id mid-turn) takes its disabled-lease no-op branch instead of
+    the fallback that would claim a real second slot in the child. It must NOT
+    be marked ``released``: a released lease trips ``transfer_active_session``'s
+    ``if lease.released`` early-return, which bypasses the disabled branch and
+    falls through to that real re-claim. A real lease already present (native,
+    non-isolated path) is never overwritten.
+    """
+    if not frame.get("active_session_admitted"):
+        return
+    if session.get("active_session_lease") is not None:
+        return
+    from hermes_cli.active_sessions import ActiveSessionLease
+
+    session["active_session_lease"] = ActiveSessionLease(
+        lease_id=f"delegated:{frame.get('session_key') or ''}",
+        session_id=str(frame.get("session_key") or ""),
+        surface="compute-host",
+        enabled=False,
+        released=False,
+    )
+
+
 def _lease_retry(attempts: int, fn) -> Exception | None:
     """Call ``fn`` up to ``attempts`` times (50ms*n backoff: registry writes contend across processes); last
     exception when every try failed, else None."""

@@ -66,7 +66,17 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
-        "queued_prompt_generation": queued_prompt_generation}
+        "queued_prompt_generation": queued_prompt_generation,
+        # Turn-isolation lease handoff (Design 1). This turn was already admitted
+        # through the per-session ownership chokepoint in THIS (serving) process,
+        # which holds the real active-session lease. The compute-host child
+        # re-crosses that chokepoint in _run_prompt_submit but cannot recognise
+        # the serving process's lease across the process boundary
+        # (_is_same_writer requires an equal pid). Signal the admission so the
+        # child installs a disabled sentinel lease instead of re-claiming a
+        # second registry slot -- keeping exactly one admission and leaving the
+        # #94778 double-writer guard intact.
+        "active_session_admitted": session.get("active_session_lease") is not None}
 
 
 def _metadata_mirror(session: dict | None) -> dict:
