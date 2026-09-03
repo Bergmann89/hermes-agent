@@ -208,6 +208,12 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     info = _compute_host_session_info(session)
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
+    # Blocker 1 (#99719): the child has reported this turn done (turn.end /
+    # turn.error, including the crash path via _fail_pending_turns' on_complete).
+    # It is no longer writing under sid, so release any lease detached-and-
+    # deferred at close/idle-reap. Idempotent keyed pop -- a no-op when nothing
+    # was detached (the common case).
+    _release_detached_leases_for_dead_child(sid)
     _drain_queued_prompt(rid, sid, session)
 
 

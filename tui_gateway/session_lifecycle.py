@@ -131,6 +131,87 @@ def _own_live_lease_ids(*, exclude=None) -> set[str]:
                 if (lease := session.get("active_session_lease")) is not None and lease is not exclude}
 
 
+def _release_active_session_lease(lease) -> bool:
+    """Release a bare lease object (no session dict), liveness-tracked leases get 3 tries; True when released."""
+    if lease is None:
+        return True
+    if (err := _lease_retry(3 if getattr(lease, "track_liveness", False) else 1, lambda: lease.release())) is not None:
+        logger.warning("Failed to release active session slot", exc_info=err)
+        return False
+    return bool(getattr(lease, "released", True) or not getattr(lease, "enabled", True))
+
+
+def _ownership_owed_to_live_child(session: dict | None) -> bool:
+    """True when the real lease must be HELD past close because an isolated
+    compute-host child may still be writing this session.
+
+    Blocker 1 (#99719): the child re-crosses the ownership chokepoint with only
+    a DISABLED sentinel; its write-exclusivity rests ENTIRELY on this serving
+    process holding the one real enabled lease for the whole turn. Releasing it
+    while ``running`` is still true (the child has not reported turn.end) drops
+    the registry entry out from under a live writer and reopens the
+    double-writer window. In that case ownership is DETACHED-and-deferred, not
+    released.
+    """
+    if not session:
+        return False
+    lease = session.get("active_session_lease")
+    if lease is None or not getattr(lease, "enabled", False):
+        return False
+    if not (session.get("running") or session.get("_compute_host_active")):
+        return False
+    try:
+        return bool(_session_uses_compute_host(session))
+    except Exception:
+        return False
+
+
+def _detached_lease_key(sid: str, lease) -> str:
+    return f"{sid}:{getattr(lease, 'lease_id', '')}"
+
+
+def _detach_lease_for_deferred_release(
+    sid: str, lease, *, session: dict | None = None
+) -> str:
+    """Move the still-enabled real lease out of the session dict into the
+    process-global detached table, as ONE critical section under
+    ``_sessions_lock`` that inserts into ``_detached_leases`` BEFORE removing it
+    from the session dict (insert-before-remove).
+
+    Returns the detached-table key. Idempotent for a given (sid, lease).
+    """
+    key = _detached_lease_key(sid, lease)
+    with _sessions_lock:
+        # Insert first: a reaper tick that acquires _sessions_lock between the
+        # two mutations must never find the lease in NEITHER map.
+        _detached_leases[key] = lease
+        if session is not None and session.get("active_session_lease") is lease:
+            session.pop("active_session_lease", None)
+    return key
+
+
+def _release_detached_leases_for_dead_child(sid: str | None = None) -> int:
+    """Release detached leases whose isolated child has exited.
+
+    Called from the per-turn done receipt (``_on_compute_host_turn_done`` for a
+    single sid), the child-death paths (``host_supervisor._wait_for_exit`` ahead
+    of the ``_closing`` guard, and ``shutdown()``), and the crash callback. When
+    ``sid`` is None every detached lease is released (whole-child exit). Each
+    release is an idempotent keyed pop, so overlapping callers are safe.
+    """
+    with _sessions_lock:
+        if sid is None:
+            popped = list(_detached_leases.items())
+            _detached_leases.clear()
+        else:
+            prefix = f"{sid}:"
+            keys = [k for k in _detached_leases if k.startswith(prefix)]
+            popped = [(k, _detached_leases.pop(k)) for k in keys]
+    for _key, lease in popped:
+        _release_active_session_lease(lease)
+    return len(popped)
+
+
 @contextlib.contextmanager
 def _other_runtime_lease_guard(session_id: str, session: dict):
     """Release this runtime and lock sibling ownership through the DB write. Yields True (another runtime owns
@@ -243,7 +324,21 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         end_reason in _AUTOMATIC_SESSION_END_REASONS and _session_source(session).strip().lower() == "desktop")
     # Automatic Desktop cleanup releases its lease inside the lifecycle guard below; other paths keep force/end semantics.
     if not _desktop_automatic_cleanup:
-        _release_active_session_slot(session)
+        # Blocker 1 (#99719): do NOT release the canonical lease while an
+        # isolated compute-host child may still be writing this session. When
+        # ownership is still owed to a live child, DETACH-and-defer the enabled
+        # lease instead -- the registry entry keeps protecting the id until the
+        # child actually exits (turn.end / crash / child-death), reconciled with
+        # the idle reaper (which skips detached leases) and the child-death
+        # release paths. Otherwise a bounded close would drop the lease out from
+        # under a live writer and reopen the double-writer window.
+        if _ownership_owed_to_live_child(session):
+            lease = session.get("active_session_lease")
+            _detach_lease_for_deferred_release(
+                str(session.get("_sid") or ""), lease, session=session
+            )
+        else:
+            _release_active_session_slot(session)
     if (stop_event := session.get("_notif_stop")) is not None:
         stop_event.set()
     agent = session.get("agent")

@@ -190,6 +190,11 @@ class HostSupervisor:
             self._terminate_process(proc)
         finally:
             self._remove_registry()
+            # Blocker 1a (#99719): the child has exited / been terminated. Cover
+            # the path where shutdown() reaps the child itself rather than
+            # _wait_for_exit observing it -- release detached leases here too.
+            # Idempotent with the _wait_for_exit call (keyed pop).
+            self._release_detached_on_child_exit()
 
     def reconcile_startup_orphan(self) -> str:
         """Terminate a stale registered host, guarding against PID reuse."""
@@ -408,8 +413,34 @@ class HostSupervisor:
             if pending is not None and pending[1] is not None:
                 _call_logged(pending[1], frame, "compute host turn completion callback failed")
 
+    def _release_detached_on_child_exit(self) -> None:
+        """Release all leases the serving process detached for deferred release
+        because their isolated child (the one shared child this supervisor owns)
+        may still have been writing. On child exit that is no longer possible.
+
+        In-process call into the serving-process server module (the supervisor
+        runs in the same process). Idempotent keyed pop, so overlapping callers
+        (``_wait_for_exit`` and ``shutdown``) are safe. Imported lazily and
+        looked up at call time so tests can monkeypatch the release.
+        """
+        try:
+            from tui_gateway import server as _server
+
+            _server._release_detached_leases_for_dead_child()
+        except Exception:
+            logger.debug("detached-lease release on child exit failed", exc_info=True)
+
     def _wait_for_exit(self, proc: subprocess.Popen[str]) -> None:
         code = proc.wait()
+        # Blocker 1a (#99719): the shared child has EXITED. Any lease detached
+        # for deferred release (its write-exclusivity was owed to this child)
+        # must be released now, on EVERY observed exit -- closing or not. This
+        # runs AHEAD of the `_closing` early-return below because graceful
+        # shutdown sets `_closing=True` before the child exits, and turn.end
+        # never arrives for a dead child, so without this the detached lease
+        # would leak (the owning pid is the still-alive serving process, so
+        # _prune_dead cannot reclaim it) -> a self-inflicted DoS on the id.
+        self._release_detached_on_child_exit()
         if self._closing:
             return
         with self._lock:
