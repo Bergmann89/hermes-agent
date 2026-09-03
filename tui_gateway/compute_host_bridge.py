@@ -127,9 +127,147 @@ def _compute_host_adopt_frame_meta(session: dict, frame: dict) -> None:
                                              int(frame.get("history_version") or 0))
 
 
+_reanchor_outcomes: dict[tuple[str, int], dict] = {}
+_reanchor_outcomes_lock = threading.Lock()
+
+
+def _handle_active_session_reanchor(params: dict) -> dict:
+    """Owner-side of the Blocker-2 (#99719) mid-turn re-anchor handshake.
+
+    Runs on the supervisor stdout-reader thread (the same thread as
+    _relay_compute_host_rpc). The child proposes moving the REAL registry lease
+    A->B before it commits continuation B. This handler validates the quoted
+    ``lease_id``+``generation`` against the real enabled lease it holds for the
+    session, then performs the SINGLE atomic transfer via the enabled
+    ``transfer_active_session`` path (the only registry writer -- no parallel
+    store).
+
+    Idempotent and outcome-recorded, keyed by ``(request_id, generation)``:
+    a first proposal transfers and records; a duplicate or a status re-query
+    returns the recorded outcome WITHOUT re-transferring (a same-id A->B is a
+    no-op that returns ``applied:true``). ``applied:false`` is emitted ONLY on
+    the handler's own exception raised BEFORE the file-locked commit;
+    ``applied:true`` only after the commit is durable -- so a committed transfer
+    is the point of no return and a lost ack never becomes a phantom lease.
+
+    MANDATE (#99719): this handler MUST NOT acquire ``session['history_lock']``
+    -- it needs only the lease object and the registry file lock inside
+    ``transfer_active_session`` -- so no cross-process lock cycle can form even
+    if a serving path regressed to holding history_lock across the child.
+    """
+    sid = str(params.get("session_id") or "")
+    request_id = str(params.get("request_id") or "")
+    try:
+        generation = int(params.get("generation", 0) or 0)
+    except (TypeError, ValueError):
+        generation = 0
+    key = (request_id, generation)
+
+    # Recorded-outcome fast path: duplicate proposal or status re-query.
+    with _reanchor_outcomes_lock:
+        recorded = _reanchor_outcomes.get(key)
+    if recorded is not None:
+        return dict(recorded)
+
+    # A status re-query with no recorded outcome means the original proposal was
+    # never processed here (e.g. the handler thread never ran). Report
+    # not-applied so the child fails closed rather than assuming a commit.
+    if params.get("type") == "active_session.reanchor.status":
+        return {"request_id": request_id, "generation": generation, "applied": False}
+
+    new_id = str(params.get("new_id") or "")
+    quoted_lease_id = str(params.get("lease_id") or "")
+    try:
+        session = _sessions.get(sid)
+        if session is None:
+            raise RuntimeError(f"no live session for re-anchor: sid={sid}")
+        lease = session.get("active_session_lease")
+        if lease is None or not getattr(lease, "enabled", False):
+            raise RuntimeError("serving process holds no enabled lease for re-anchor")
+        if quoted_lease_id and str(getattr(lease, "lease_id", "")) != quoted_lease_id:
+            raise RuntimeError("re-anchor lease_id mismatch (stale proposal)")
+        current_generation = int(session.get("_active_session_generation", 0) or 0)
+        if generation != current_generation:
+            raise RuntimeError(
+                f"re-anchor generation mismatch: quoted={generation} "
+                f"current={current_generation}"
+            )
+        if not new_id:
+            raise RuntimeError("re-anchor missing new session id")
+
+        from hermes_cli.active_sessions import transfer_active_session
+
+        # THE SINGLE ATOMIC TRANSFER POINT (enabled path, file-locked A->B).
+        # A same-id A->B (lease already on new_id) is a no-op that returns True.
+        committed = transfer_active_session(
+            lease,
+            session_id=new_id,
+            metadata={"live_session_id": sid},
+        )
+        if not committed:
+            raise RuntimeError("registry transfer did not commit")
+    except Exception as exc:
+        # Handler exception BEFORE the durable commit -> nack. Not recorded:
+        # nothing durable changed, so a later reconciliation is free to resolve
+        # the state, but the child aborts to A on this answer.
+        logger.warning(
+            "active-session re-anchor refused: sid=%s request_id=%s: %s",
+            sid,
+            request_id,
+            exc,
+        )
+        return {"request_id": request_id, "generation": generation, "applied": False}
+
+    # Committed and durable. Bump the generation so a stale racing proposal is
+    # nacked, and record the outcome so a duplicate/status re-query is a no-op.
+    session["_active_session_generation"] = current_generation + 1
+    outcome = {
+        "request_id": request_id,
+        "generation": generation,
+        "applied": True,
+        "new_generation": current_generation + 1,
+    }
+    with _reanchor_outcomes_lock:
+        _reanchor_outcomes[key] = dict(outcome)
+    return outcome
+
+
+def _emit_active_session_reanchor_ack(params: dict, outcome: dict) -> None:
+    """Send the correlated inbound ack down to the child (best effort).
+
+    The child's stdin reader routes ``active_session.reanchor.ack`` to the
+    blocked worker's per-(request_id, generation) Event. Delivery failure is
+    non-fatal: the child's bounded ack timeout drives a single status re-query,
+    and a committed transfer is already durable in the registry.
+    """
+    sid = str(params.get("session_id") or "")
+    ack = {
+        "type": "active_session.reanchor.ack",
+        "sid": sid,
+        "request_id": outcome.get("request_id"),
+        "generation": outcome.get("generation"),
+        "applied": bool(outcome.get("applied")),
+    }
+    try:
+        _get_compute_host_supervisor().send_frame(ack)
+    except Exception:
+        logger.debug("re-anchor ack delivery failed", exc_info=True)
+
+
 def _relay_compute_host_rpc(message: dict) -> bool:
     """Relay host events while retaining the clarify snapshot needed on resume."""
     params = message.get("params") if isinstance(message, dict) else None
+    # Blocker 2 (#99719): the child's mid-turn compression re-anchor proposal is
+    # an INTERNAL request/reply, not a UI event. Handle it and its status
+    # re-query here and EARLY-RETURN -- it must NOT fall through to write_json
+    # below, which would leak the handshake frame to every connected UI client.
+    if isinstance(params, dict) and params.get("type") in (
+        "active_session.reanchor",
+        "active_session.reanchor.status",
+    ):
+        outcome = _handle_active_session_reanchor(params)
+        _emit_active_session_reanchor_ack(params, outcome)
+        return True
     kind = params.get("type") if isinstance(params, dict) else None
     if kind in {"clarify.request", "clarify.expire"}:
         session = _sessions.get(str(params.get("session_id") or ""))
