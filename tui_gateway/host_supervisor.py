@@ -243,6 +243,18 @@ class HostSupervisor:
         self._send_frame(
             {"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
 
+    def send_frame(self, frame: dict[str, Any]) -> None:
+        """Send a control/ack frame down to the running child (best effort).
+
+        Used for the Blocker-2 (#99719) reverse-RPC: the serving process
+        answers the child's mid-turn re-anchor proposal with an inbound
+        ``active_session.reanchor.ack`` frame the child's stdin reader routes to
+        its blocked worker. Never (re)starts the child -- if it is not running
+        there is no worker to ack, and the child fails closed on its own ack
+        timeout.
+        """
+        self._send_frame(frame)
+
     def _await_reply(self, frame: dict[str, Any], request_id: str, timeout: float) -> dict:
         """Send ``frame`` and block for the host reply carrying ``request_id``."""
         q: queue.Queue[dict] = queue.Queue(maxsize=1)
