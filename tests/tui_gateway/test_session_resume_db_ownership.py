@@ -132,7 +132,7 @@ def test_resume_closes_profile_db_when_session_not_found(profile_dbs):
     scoped = [
         db
         for db in profile_dbs
-        if db.db_path is not None and "work" in str(db.db_path)
+        if db.db_path is not None and str(db.db_path).endswith("work/state.db")
     ]
     assert len(scoped) == 1
     assert scoped[0].closed == 1
