@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -22,6 +23,9 @@ from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
 
 def now_ns() -> int:
     return time.perf_counter_ns()
+
+
+logger = logging.getLogger(__name__)
 
 
 class _HostTransport:
@@ -87,6 +91,11 @@ class ComputeHost:
         # that already lets clarify/approval block mid-turn.
         self._reanchor_waiters: dict[tuple[str, int], threading.Event] = {}
         self._reanchor_results: dict[tuple[str, int], bool] = {}
+        # #99719 round-2: the owner bumps its generation to N+1 on a committed
+        # transfer and forwards it in the ack. Capture it so a SECOND mid-turn
+        # rotation quotes the REFRESHED generation instead of the stale
+        # install-time snapshot (which would be nacked on generation mismatch).
+        self._reanchor_new_generations: dict[tuple[str, int], int] = {}
         self._reanchor_lock = threading.Lock()
         self._heartbeat_secs = (
             float(heartbeat_secs) if heartbeat_secs is not None
@@ -383,6 +392,12 @@ class ComputeHost:
         key = (request_id, generation)
         with self._reanchor_lock:
             self._reanchor_results[key] = bool(frame.get("applied"))
+            new_generation = frame.get("new_generation")
+            if new_generation is not None:
+                try:
+                    self._reanchor_new_generations[key] = int(new_generation)
+                except (TypeError, ValueError):
+                    pass
             event = self._reanchor_waiters.get(key)
         if event is not None:
             event.set()
@@ -441,7 +456,12 @@ class ComputeHost:
             )
             if event.wait(timeout=_REANCHOR_ACK_TIMEOUT_SECONDS):
                 with self._reanchor_lock:
-                    return bool(self._reanchor_results.get(key, False))
+                    applied = bool(self._reanchor_results.get(key, False))
+                    if applied:
+                        new_gen = self._reanchor_new_generations.get(key)
+                        if new_gen is not None:
+                            admission["generation"] = new_gen
+                    return applied
 
             # Ack timed out. ONE bounded status re-query for the SAME key.
             event.clear()
@@ -463,13 +483,19 @@ class ComputeHost:
             )
             if event.wait(timeout=_REANCHOR_ACK_TIMEOUT_SECONDS):
                 with self._reanchor_lock:
-                    return bool(self._reanchor_results.get(key, False))
+                    applied = bool(self._reanchor_results.get(key, False))
+                    if applied:
+                        new_gen = self._reanchor_new_generations.get(key)
+                        if new_gen is not None:
+                            admission["generation"] = new_gen
+                    return applied
             # No committed answer at all -> fail the turn closed (do NOT write B).
             return False
         finally:
             with self._reanchor_lock:
                 self._reanchor_waiters.pop(key, None)
                 self._reanchor_results.pop(key, None)
+                self._reanchor_new_generations.pop(key, None)
 
     def _install_pre_rotation_reanchor(self, server: Any, sid: str, session: dict) -> None:
         """Wire the pre-rotation re-anchor callback onto the child's agent.
@@ -493,8 +519,20 @@ class ComputeHost:
 
         try:
             agent._pre_rotation_reanchor = _callback
-        except Exception:
-            pass
+        except Exception as exc:
+            # FAIL CLOSED (#99719): the session carries a delegated admission, so
+            # a mid-turn compression MUST re-anchor the real registry lease A->B
+            # before publishing B. If the hook cannot be installed, the turn
+            # would rotate hook-less and reopen the double-writer window the
+            # design closes. Raise so the caller's turn-outer except aborts the
+            # turn (turn.error) rather than proceeding unprotected.
+            logger.warning(
+                "failed to install pre-rotation re-anchor hook for sid=%s; "
+                "failing the turn closed: %s",
+                sid,
+                exc,
+            )
+            raise
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
         def body(server: Any, sid: str, request_id: Any) -> None:

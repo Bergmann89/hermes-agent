@@ -227,6 +227,117 @@ class TestR7CommittedTransferThenLostAck:
             host.close()
 
 
+class TestGenerationRefreshedAcrossRotations:
+    def test_second_rotation_quotes_refreshed_generation_and_commits(
+        self, monkeypatch, tmp_path
+    ):
+        # #99719 round-2: two SEQUENTIAL mid-turn rotations. The first re-anchor
+        # A->B commits; the owner bumps its generation 0->1 and forwards
+        # new_generation in the ack. The child must WRITE that back into the
+        # shared admission dict so the SECOND re-anchor B->C quotes generation=1
+        # (the refreshed value) and COMMITS. FAILS on HEAD: the ack drops
+        # new_generation and the admission snapshot stays 0, so the second
+        # rotation is nacked on a generation mismatch (quoted=0 current=1).
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(compute_host, "_REANCHOR_ACK_TIMEOUT_SECONDS", 0.2)
+
+        owner_lease, _ = server._claim_active_session_slot(
+            "A", live_session_id="sid", surface="tui"
+        )
+        assert owner_lease is not None and owner_lease.enabled
+
+        session = _isolated_session(lease=owner_lease)
+        with server._sessions_lock:
+            server._sessions["sid"] = session
+
+        host = compute_host.ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+
+        # The shared admission object (session["_delegated_admission"] by ref).
+        admission = {"lease_id": owner_lease.lease_id, "generation": 0}
+
+        def _emit(frame):
+            msg = frame.get("message") or {} if frame.get("type") == "rpc" else {}
+            params = msg.get("params") or {}
+            kind = params.get("type")
+            if kind in ("active_session.reanchor", "active_session.reanchor.status"):
+                # Owner handles the proposal and forwards the ack (with the
+                # bumped new_generation, exactly like _emit_active_session_reanchor_ack).
+                outcome = server._handle_active_session_reanchor(params)
+                host.handle_frame(
+                    {
+                        "type": "active_session.reanchor.ack",
+                        "request_id": outcome.get("request_id"),
+                        "generation": outcome.get("generation"),
+                        "applied": bool(outcome.get("applied")),
+                        "new_generation": outcome.get("new_generation"),
+                    }
+                )
+
+        monkeypatch.setattr(host, "emit", _emit)
+        try:
+            # First rotation A->B commits; admission generation refreshes 0->1.
+            applied1 = host._reanchor_active_session("sid", "A", "B", admission)
+            assert applied1 is True
+            assert admission["generation"] == 1, "admission not refreshed after A->B"
+
+            # Second rotation B->C quotes the REFRESHED generation and commits.
+            applied2 = host._reanchor_active_session("sid", "B", "C", admission)
+            assert applied2 is True, "second rotation nacked on stale generation"
+            assert admission["generation"] == 2
+
+            # The registry lease moved B->C: C is protected, B is free.
+            c2, cr = server._claim_active_session_slot(
+                "C", live_session_id="third-party", surface="tui"
+            )
+            assert c2 is None and cr is not None, "C not protected after B->C"
+            b2, br = server._claim_active_session_slot(
+                "B", live_session_id="third-party", surface="tui"
+            )
+            assert b2 is not None and br is None, "B not freed after B->C"
+        finally:
+            host.close()
+            with server._sessions_lock:
+                server._sessions.pop("sid", None)
+
+
+class TestFailClosedHookInstall:
+    class _RejectingAgent:
+        # An agent object that refuses the re-anchor attribute assignment.
+        __slots__ = ()
+
+        def __setattr__(self, name, value):
+            raise AttributeError(f"cannot set {name}")
+
+    def test_install_raises_when_assignment_fails_with_admission(self):
+        # #99719: a session carrying a delegated admission whose agent rejects
+        # the hook assignment must FAIL CLOSED -- _install_pre_rotation_reanchor
+        # raises so the turn's outer except emits turn.error rather than
+        # proceeding hook-less (a mid-turn rotation would then reopen the
+        # double-writer window). FAILS on HEAD: the assignment error is swallowed
+        # (except Exception: pass) and the turn proceeds unprotected.
+        host = compute_host.ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+        try:
+            session = {
+                "agent": self._RejectingAgent(),
+                "_delegated_admission": {"lease_id": "L", "generation": 0},
+            }
+            with pytest.raises(Exception):
+                host._install_pre_rotation_reanchor(server, "sid", session)
+        finally:
+            host.close()
+
+    def test_install_is_noop_without_admission(self):
+        # A session with NO delegated admission (serving/in-process path) is a
+        # clean no-op even if the agent would reject the assignment -- the early
+        # return fires before any attribute is touched, so no turn is failed.
+        host = compute_host.ComputeHost(stdout=io.StringIO(), heartbeat_secs=0)
+        try:
+            session = {"agent": self._RejectingAgent(), "_delegated_admission": None}
+            host._install_pre_rotation_reanchor(server, "sid", session)  # no raise
+        finally:
+            host.close()
+
+
 def _make_agent(session_db, session_id="A"):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent

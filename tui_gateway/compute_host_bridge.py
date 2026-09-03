@@ -247,6 +247,7 @@ def _emit_active_session_reanchor_ack(params: dict, outcome: dict) -> None:
         "request_id": outcome.get("request_id"),
         "generation": outcome.get("generation"),
         "applied": bool(outcome.get("applied")),
+        "new_generation": outcome.get("new_generation"),
     }
     try:
         _get_compute_host_supervisor().send_frame(ack)
