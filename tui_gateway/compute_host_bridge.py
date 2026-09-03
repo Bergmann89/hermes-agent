@@ -76,7 +76,36 @@ def _compute_host_turn_frame(
         # child installs a disabled sentinel lease instead of re-claiming a
         # second registry slot -- keeping exactly one admission and leaving the
         # #94778 double-writer guard intact.
+        #
+        # Blocker 2 (#99719): carry the QUALIFIED admission identity (the real
+        # lease_id, the admitted session id A, and a monotonic generation) so
+        # the child can quote it back verbatim when it proposes a mid-turn
+        # compression re-anchor A->B over the reverse-RPC handshake. The bare
+        # ``active_session_admitted`` boolean is derived from
+        # ``active_session_admission is not None`` for back-compat during
+        # rollout (consumer: _install_delegated_active_session_lease).
+        "active_session_admission": _turn_admission_record(session),
+        # Legacy boolean, DERIVED from the qualified record for back-compat
+        # during rollout (old consumers / frames still on the bare flag).
         "active_session_admitted": session.get("active_session_lease") is not None}
+
+
+def _turn_admission_record(session: dict) -> dict | None:
+    """Build the qualified admission record stamped into the turn frame.
+
+    ``None`` when the serving process holds no real lease for the session (the
+    old ``active_session_admitted is False`` case). Otherwise it carries the
+    authoritative ``lease_id``, the admitted session id, and a monotonic
+    ``generation`` the child quotes back verbatim in the re-anchor proposal.
+    """
+    lease = session.get("active_session_lease")
+    if lease is None:
+        return None
+    return {
+        "lease_id": str(getattr(lease, "lease_id", "") or ""),
+        "session_id": str(session.get("session_key") or ""),
+        "generation": int(session.get("_active_session_generation", 0) or 0),
+    }
 
 
 def _metadata_mirror(session: dict | None) -> dict:
