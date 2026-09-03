@@ -79,13 +79,25 @@ def _install_delegated_active_session_lease(session: dict, frame: dict) -> None:
     ``if lease.released`` early-return, which bypasses the disabled branch and
     falls through to that real re-claim. A real lease already present (native,
     non-isolated path) is never overwritten.
+
+    Blocker 2 (#99719): admission is now carried as the qualified
+    ``active_session_admission`` record ``{lease_id, session_id, generation}``.
+    The old bare ``active_session_admitted`` boolean is derived from
+    ``admission is not None`` for back-compat during rollout. The record is
+    stashed on the session (``_delegated_admission``) so the child can quote it
+    back verbatim in its mid-turn re-anchor proposal.
     """
-    if not frame.get("active_session_admitted"):
+    admission = frame.get("active_session_admission")
+    # Back-compat: derive from either the qualified record or the legacy bool.
+    admitted = admission is not None or bool(frame.get("active_session_admitted"))
+    if not admitted:
         return
     if session.get("active_session_lease") is not None:
         return
     from hermes_cli.active_sessions import ActiveSessionLease
 
+    if isinstance(admission, dict):
+        session["_delegated_admission"] = dict(admission)
     session["active_session_lease"] = ActiveSessionLease(
         lease_id=f"delegated:{frame.get('session_key') or ''}",
         session_id=str(frame.get("session_key") or ""),
