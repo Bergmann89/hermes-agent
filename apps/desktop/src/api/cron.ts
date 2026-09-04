@@ -39,6 +39,16 @@ export function getCronJob(jobId: string): Promise<CronJob> {
   })
 }
 
+// Cron mutations target ONE per-profile store. The list aggregator stamps each
+// job's owning profile (CronJob.profile); pass it here so the backend resolves
+// the right store instead of falling back to the caller's ambient profile,
+// which from a cross-profile view triggers/pauses/deletes the wrong store or
+// 404s with "Job not found". A concrete profile becomes ?profile=<name>; omit
+// it to keep the legacy ambient-profile behavior for single-profile callers.
+function profileQuery(profile?: string): string {
+  return profile ? `?profile=${encodeURIComponent(profile)}` : ''
+}
+
 export async function getCronJobRuns(jobId: string, limit = 20): Promise<SessionInfo[]> {
   const { runs } = await hermesApi<{ runs: SessionInfo[] }>({
     ...profileScoped(),
@@ -72,49 +82,49 @@ export function createCronJob(body: CronJobCreatePayload): Promise<CronJob> {
   })
 }
 
-export function updateCronJob(jobId: string, updates: CronJobUpdates): Promise<CronJob> {
+export function updateCronJob(jobId: string, updates: CronJobUpdates, profile?: string): Promise<CronJob> {
   return hermesApi<CronJob>({
     ...profileScoped(),
     ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${profileQuery(profile)}`,
     method: 'PUT',
     body: { updates }
   })
 }
 
-export function pauseCronJob(jobId: string): Promise<CronJob> {
+export function pauseCronJob(jobId: string, profile?: string): Promise<CronJob> {
   return hermesApi<CronJob>({
     ...profileScoped(),
     ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause`,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/pause${profileQuery(profile)}`,
     method: 'POST'
   })
 }
 
-export function resumeCronJob(jobId: string): Promise<CronJob> {
+export function resumeCronJob(jobId: string, profile?: string): Promise<CronJob> {
   return hermesApi<CronJob>({
     ...profileScoped(),
     ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume`,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/resume${profileQuery(profile)}`,
     method: 'POST'
   })
 }
 
-export function triggerCronJob(jobId: string): Promise<CronJob> {
+export function triggerCronJob(jobId: string, profile?: string): Promise<CronJob> {
   return hermesApi<CronJob>({
     ...profileScoped(),
     ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger`,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}/trigger${profileQuery(profile)}`,
     method: 'POST',
     timeoutMs: CRON_TRIGGER_REQUEST_TIMEOUT_MS
   })
 }
 
-export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
+export function deleteCronJob(jobId: string, profile?: string): Promise<{ ok: boolean }> {
   return hermesApi<{ ok: boolean }>({
     ...profileScoped(),
     ...connectionScoped(),
-    path: `/api/cron/jobs/${encodeURIComponent(jobId)}`,
+    path: `/api/cron/jobs/${encodeURIComponent(jobId)}${profileQuery(profile)}`,
     method: 'DELETE'
   })
 }
