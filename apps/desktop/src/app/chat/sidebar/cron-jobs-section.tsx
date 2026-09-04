@@ -252,7 +252,7 @@ function CronJobSidebarRow({
   // row updates in place.
   const togglePause = async () => {
     try {
-      const updated = isPaused ? await resumeCronJob(job.id) : await pauseCronJob(job.id)
+      const updated = isPaused ? await resumeCronJob(job.id, job.profile) : await pauseCronJob(job.id, job.profile)
       updateCronJobs(rows => rows.map(row => (row.id === job.id ? updated : row)))
       notify({ kind: 'success', title: isPaused ? c.resumed : c.paused, message: label })
     } catch (err) {
@@ -273,7 +273,7 @@ function CronJobSidebarRow({
     }
 
     try {
-      await deleteCronJob(job.id)
+      await deleteCronJob(job.id, job.profile)
       updateCronJobs(rows => rows.filter(row => row.id !== job.id))
       notify({ kind: 'success', title: c.deleted, message: label })
     } catch (err) {
