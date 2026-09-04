@@ -79,6 +79,16 @@ with contextlib.suppress(Exception):
 from tui_gateway.render import make_stream_renderer, render_diff, render_message  # noqa: F401
 
 _sessions: dict[str, dict] = {}
+# Blocker 1 (#99719): canonical active-session leases DETACHED from their
+# session dict at close/idle-reap while an isolated compute-host CHILD may still
+# be writing. The lease stays ENABLED and its registry entry keeps protecting
+# the session id until the child actually exits; release is deferred to the
+# per-turn done receipt / child-death paths. Keyed by "<sid>:<lease_id>". Guarded
+# by the EXISTING _sessions_lock (the same lock the idle reaper holds while it
+# reads _sessions to build `live`) -- no new lock, so the reaper can never observe
+# a lease that is in neither map (detach inserts here BEFORE removing from the
+# session dict, as one critical section).
+_detached_leases: dict[str, Any] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
@@ -375,8 +385,16 @@ def _get_db():
     global _db, _db_error
     if _db is None:
         from hermes_state_registry import acquire
+        from hermes_state import default_root_db_path
         try:
-            _db, _db_error = acquire(), None
+            # Bind the EXPLICIT default-root state.db, NOT the lazy no-path
+            # acquire() which resolves against the context-local HERMES_HOME at
+            # first call. This process-global memo is reused by every default
+            # build/persist site (_ensure_session_db_row, _init_session), so a
+            # first call under a residual foreign home used to poison the memo
+            # -- pinning it to the default root closes that cross-profile
+            # read/write vector.
+            _db, _db_error = acquire(default_root_db_path()), None
         except Exception as exc:
             _db_error = str(exc)
             logger.warning("TUI session store unavailable — continuing without state.db features: %s", exc)
