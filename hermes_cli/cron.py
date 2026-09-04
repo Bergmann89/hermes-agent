@@ -580,6 +580,7 @@ def cron_create(args):
            if getattr(args, "paused", False) or getattr(args, "paused_reason", None) is not None else {}),
         prompt_file=getattr(args, "prompt_file", None),
         no_cron_hint=getattr(args, "no_cron_hint", None),
+        attach_to_session=getattr(args, "attach_to_session", None),
         **_job_api_kwargs(args))
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
