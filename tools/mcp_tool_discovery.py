@@ -9,7 +9,7 @@ import asyncio
 import logging
 import time
 from typing import Dict, List, Optional, Tuple
-from tools.mcp_tool_common import _core, _parse_boolish
+from tools.mcp_tool_common import _core, _parse_boolish, _server_enabled
 from tools import mcp_tool_config as _config
 from tools import mcp_tool_errors as _errors
 from tools import mcp_tool_lifecycle as _lifecycle
@@ -41,7 +41,7 @@ def _connect_cooldown_active(server_name: str) -> bool:
 
 
 def _enabled(cfg: dict) -> bool:
-    return _parse_boolish(cfg.get("enabled", True), default=True)
+    return _server_enabled(cfg)
 
 
 async def _connect_server(name: str, config: dict) -> _core.MCPServerTask:
@@ -125,11 +125,20 @@ def _note_connect_success(name: str) -> None:
         _clear_connect_failure(name)
 
 
-def _adopt_server(name: str, server: _core.MCPServerTask) -> None:
-    """Publish *server* into ``_servers`` with its owning registry scope (under ``_lock``)."""
+def _adopt_server(name: str, server: _core.MCPServerTask, config: Optional[dict] = None) -> None:
+    """Publish *server* into ``_servers`` with its owning registry scope (under ``_lock``).
+
+    Also records the connection-defining fingerprint of the config that opened it, so the
+    cross-profile heal (register_connected_into_current_scope) can refuse to re-register a
+    same-named-but-differently-routed server into another profile's scope (a shared connection must
+    not be borrowed across profiles that configured different transports/credentials).
+    """
     with _core._lock:
         _core._servers[name] = server
         _core._server_scope_keys[name] = _core._mcp_registry_scope()
+        if config is not None:
+            from tools.mcp_schema_cache import config_fingerprint
+            _core._server_config_fingerprints[name] = config_fingerprint(config)
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
@@ -212,7 +221,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         if (server is not None and server._error is not None and task is not None
                 and not task.done() and not task_cancelling):
             # Recoverable park: the run task self-probes, so adopt it for shutdown/revival.
-            _adopt_server(name, server)
+            _adopt_server(name, server, config)
         elif server is not None:
             await server.shutdown()
         raise
@@ -221,7 +230,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     with _core._lock:
         _core._server_connecting.discard(name)
         _core._server_connect_errors.pop(name, None)
-    _adopt_server(name, server)
+    _adopt_server(name, server, config)
     registered_names = _registration._register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
     logger.info("MCP server '%s' (%s): registered %d tool(s): %s", name,
@@ -366,7 +375,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("No explicit MCP servers provided")
         return []
     new_servers = _select_new_servers(servers)
+    # Heal the #67605 cross-profile gap: under multiplexing a server connected by an earlier profile
+    # is already in _core._servers, so _select_new_servers drops it and the early-returns below skip
+    # registration — leaving THIS profile's scope overlay empty. Re-register such already-connected
+    # servers' live tools into the current scope (idempotent, no new subprocess) before returning.
+    scoped_healed = _registration.register_connected_into_current_scope(servers)
     if not new_servers:
+        if scoped_healed:
+            logger.info("MCP: registered %d already-connected server(s) into this profile scope", scoped_healed)
         return _registration._existing_tool_names()
     new_servers, lazy_registered, lazy_server_count = _register_lazy_from_cache(new_servers)
     if not new_servers:

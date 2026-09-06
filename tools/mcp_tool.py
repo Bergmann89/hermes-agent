@@ -401,6 +401,15 @@ _servers: Dict[str, MCPServerTask] = {}
 # Profile registry scope per live connection (None outside multiplex) so a multiplexed
 # /reload-mcp tears down only its own profile's servers.
 _server_scope_keys: Dict[str, Optional[str]] = {}
+# Every registry scope a server's tools were registered INTO (a shared connection is registered
+# once per served profile overlay). Used to deregister from all of them on teardown, so a
+# non-owning profile's tools are not orphaned. Distinct from _server_scope_keys, which is the single
+# owning scope that governs the CONNECTION lifecycle (/reload-mcp teardown selection).
+_server_tool_scopes: Dict[str, set] = {}
+# Connection-defining fingerprint of the config that OPENED each live connection. The cross-profile
+# heal refuses to re-register a same-named-but-differently-routed server into another profile's scope
+# (a shared connection must not be borrowed across profiles with different transports/credentials).
+_server_config_fingerprints: Dict[str, str] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 # Lazy startup: servers registered from the schema cache without connecting; popped on

@@ -137,6 +137,11 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _server_enabled(cfg: dict) -> bool:
+    """A server counts as enabled unless its config explicitly disables it."""
+    return _parse_boolish(cfg.get("enabled", True), default=True)
+
+
 def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
     """Optional positive lifecycle timeout from top-level/nested ``lifecycle`` config (``0``
     disables; negatives and non-numbers are warned about and ignored)."""
