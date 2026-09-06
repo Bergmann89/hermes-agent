@@ -95,7 +95,8 @@ def _worker_memory_max_bytes() -> int:
     isolation composes with PR #57121 instead of inventing a second knob.
     """
     override_bound: Optional[int] = None
-    override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
+    from tools.terminal_scope import terminal_env
+    override = terminal_env("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
     if override:
         try:
             parsed = int(override) * 1024 * 1024
@@ -1534,7 +1535,8 @@ class ProcessRegistry:
         from tools.interrupt import is_interrupted as _is_interrupted
 
         try:
-            max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
+            from tools.terminal_scope import terminal_env
+            max_timeout = int(terminal_env("TERMINAL_TIMEOUT", "180"))
         except (ValueError, TypeError):
             max_timeout = 180
         # The schema says minimum=1 but not every caller enforces it; timeout=0 is
