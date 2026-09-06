@@ -451,3 +451,42 @@ def test_snapshot_rebuild_never_grants_message_agent_to_unauthorized_sessions(
         assert _message_agent_schema_count(agent) == 0
         assert "message_agent" not in agent.valid_tool_names
         _assert_tool_snapshot_coherent(agent)
+
+
+def test_refresh_heals_current_scope_from_connected_server(monkeypatch):
+    """Per-turn heal: refresh calls register_connected_into_current_scope with THIS profile's
+    resolved config BEFORE snapshotting, so a server connected under another home becomes visible
+    in this turn's scope (#67605 desktop/tui path)."""
+    agent = _agent(["read_file"])
+    calls = {}
+
+    def _fake_heal(servers):
+        calls["servers"] = servers
+        return 1
+
+    import tools.mcp_tool_registration as _reg
+    import tools.mcp_tool_config as _cfg
+    monkeypatch.setattr(_reg, "register_connected_into_current_scope", _fake_heal)
+    monkeypatch.setattr(_cfg, "_load_mcp_config", lambda: {"codebase-memory": {"command": "ssh"}})
+
+    new_defs = [_tool(n) for n in ("read_file", "mcp__codebase_memory__list_projects")]
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: new_defs)
+
+    added = _mcp_agent.refresh_agent_mcp_tools(agent)
+
+    assert calls["servers"] == {"codebase-memory": {"command": "ssh"}}  # heal got this profile's config
+    assert "mcp__codebase_memory__list_projects" in agent.valid_tool_names
+
+
+def test_refresh_survives_heal_failure(monkeypatch):
+    """Heal is fail-soft: an exception in the scope heal never breaks the turn's refresh."""
+    agent = _agent(["read_file"])
+    import tools.mcp_tool_registration as _reg
+    monkeypatch.setattr(_reg, "register_connected_into_current_scope",
+                        lambda servers: (_ for _ in ()).throw(RuntimeError("boom")))
+    new_defs = [_tool("read_file")]
+    import model_tools
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: new_defs)
+    # Must not raise.
+    _mcp_agent.refresh_agent_mcp_tools(agent)

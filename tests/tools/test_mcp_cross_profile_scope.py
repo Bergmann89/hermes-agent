@@ -174,6 +174,24 @@ def test_no_op_outside_multiplex(tmp_path, monkeypatch):
     assert reg.register_connected_into_current_scope({"cbm": {}}) == 0
 
 
+def test_afix_multiplex_active_heal_populates_bound_profile_overlay(tmp_path):
+    """A-fix consequence: multiplex active + a bound profile home -> the per-turn heal
+    returns >=1 and the tool lands in THAT profile's overlay (not just the global slot).
+
+    This is exactly what F1 unlocks on the desktop surface: with multiplex inactive the
+    heal no-ops (see test_no_op_outside_multiplex), so the overlay stays empty.
+    """
+    from tools import mcp_tool_registration as reg
+    from agent import secret_scope as ss
+    assert ss.is_multiplex_active() is True  # set by the autouse fixture
+    _seed("cbm", ["list_projects", "search_code"])
+    key = _scope(tmp_path / "felix")  # bind felix's HERMES_HOME -> its scope key
+    healed = reg.register_connected_into_current_scope({"cbm": {}})
+    assert healed >= 1
+    got = _tools_in_scope("cbm")
+    assert any("list_projects" in t for t in got), got
+
+
 def test_route_divergence_fails_closed(tmp_path):
     # Two profiles, SAME server NAME, DIFFERENT routes. Each owns its OWN (name, fp) connection:
     # B's own connection heals into B's scope while B still refuses A's foreign-fp connection.
