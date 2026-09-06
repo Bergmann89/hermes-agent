@@ -145,6 +145,7 @@ class _TurnScopes:
     home: Any = None  # per-turn HERMES_HOME override for a resumed remote profile
     secret: Any = None
     terminal: Any = None
+    env_fallback: Any = None  # EXEMPT marker token for the default/launch session's scope
 
 
 def _route_turn_images(agent, prompt: Any, images: list[str]) -> Any:
@@ -445,11 +446,32 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     scopes.approval = set_current_session_key(session["session_key"])
     scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid)
     profile_home = session.get("profile_home")
-    if profile_home:
+    launch_home = str(_hermes_home)
+    if profile_home and Path(profile_home).resolve() != Path(launch_home).resolve():
+        # F1: serving a DISTINCT named sibling profile this turn makes the process a multiplexer
+        # for its lifetime. Flip it here (bound to the real turn), atomic with the fail-closed
+        # scope install below — never in the shared _profile_home resolver, which other RPCs call.
+        # Distinctness gate: a frame carrying the launch home falls through to the exempt branch,
+        # never the fully fail-closed named path (which would hard-break env-injected creds).
+        set_multiplex_active(True)
         scopes.home = set_hermes_home_override(profile_home)
         scopes.secret = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
         from tools.terminal_scope import install_profile_terminal_scope
         scopes.terminal = install_profile_terminal_scope(Path(profile_home))
+    else:
+        # F2: the DEFAULT/launch session ALWAYS binds its OWN per-turn scope (never inherit a
+        # peer's), built from the launch home. Bound UNCONDITIONALLY — not gated on
+        # is_multiplex_active() — so a concurrent named turn flipping multiplex mid-flight can
+        # never leave this turn unscoped (which would raise UnscopedSecretError, an auth break
+        # for the default/single-profile user). It is EXEMPT from fail-closed: env-injected creds
+        # (systemd/op run) survive a .env miss, while named siblings above stay fully fail-closed.
+        # Single-profile installs are unaffected: the launch .env overlay equals os.environ (both
+        # loaded from the same file at startup), so reads are behavior-identical to the legacy path.
+        scopes.home = set_hermes_home_override(launch_home)
+        scopes.secret = set_secret_scope(build_profile_secret_scope(Path(launch_home)))
+        scopes.env_fallback = set_secret_scope_env_fallback(True)
+        from tools.terminal_scope import install_profile_terminal_scope
+        scopes.terminal = install_profile_terminal_scope(Path(launch_home))
     # The sudo password callback is thread-local: without re-wiring here, sudo prompts
     # fall through to /dev/tty and hang the headless gateway (re-run is a no-op).
     _wire_callbacks(sid)
@@ -741,6 +763,8 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
         reset_hermes_home_override(scopes.home)
     if scopes.secret is not None:
         reset_secret_scope(scopes.secret)
+    if scopes.env_fallback is not None:
+        reset_secret_scope_env_fallback(scopes.env_fallback)
     if scopes.terminal is not None:
         from tools.terminal_scope import reset_terminal_scope
         reset_terminal_scope(scopes.terminal)

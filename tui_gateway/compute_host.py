@@ -284,9 +284,12 @@ class ComputeHost:
             session["transport"] = self._transport
             if frame.get("cols") is not None:
                 session["cols"] = int(frame.get("cols") or 80)
-            for key in ("cwd", "profile_home"):
-                if frame.get(key):
-                    session[key] = str(frame[key])
+            if frame.get("cwd"):
+                session["cwd"] = str(frame["cwd"])
+            # F3: profile_home is set AUTHORITATIVELY every reused turn — a default frame
+            # (empty profile_home) CLEARS a prior felix binding rather than inheriting it,
+            # so _prepare_turn_input can't re-bind a peer's home/secret scope on a reused sid.
+            session["profile_home"] = str(frame["profile_home"]) if frame.get("profile_home") else None
         else:
             session = self._build_server_session(server, frame, sid)
         if isinstance(frame.get("attached_images"), list):

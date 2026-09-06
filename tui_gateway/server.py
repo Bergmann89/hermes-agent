@@ -21,7 +21,7 @@ from typing import Any, Callable, NamedTuple, Optional  # noqa: F401  (Callable:
 
 # Several of these look unused here but are resolved BARE by split-module bodies rebound onto this
 # namespace (method_ctx.bind_module) — deleting one breaks a handler at call time, not import time.
-from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope  # noqa: F401
+from agent.secret_scope import build_profile_secret_scope, is_multiplex_active, reset_secret_scope, reset_secret_scope_env_fallback, set_multiplex_active, set_secret_scope, set_secret_scope_env_fallback  # noqa: F401
 from hermes_constants import (
     get_hermes_home, get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override)
 from hermes_cli.env_loader import load_hermes_dotenv
