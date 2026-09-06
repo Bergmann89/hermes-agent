@@ -117,9 +117,14 @@ def _safe_write_root_raw() -> str:
     writes (proven live: felix gated by jonas's /home/jonas).
 
     Resolve by layer, never cross-profile:
-      * scope HIT (this profile set its own value) -> use it. Fixes the leak:
-        felix/jonas each set their own, so each hits its own scope, never the
-        other's.
+      * scope HIT with a NON-EMPTY value (this profile tightened it) -> use it.
+        Fixes the leak: felix/jonas each set their own, so each hits its own
+        scope, never the other's.
+      * scope hit with an EXPLICIT EMPTY value (HERMES_WRITE_SAFE_ROOT= in the
+        profile's .env) is treated as absent, NOT as allow-all: load_env_file
+        keeps the empty entry so it reaches the scope, but an empty override must
+        not erase the container-wide floor (that would fail OPEN). It falls
+        through to the floor below, exactly like a scope miss.
       * scope MISS or unscoped -> the container-wide floor from os.environ. A
         profile that sets its own never reaches here, so this is the global
         Dockerfile floor, not another profile's secret. Crucially it is NOT the
@@ -134,8 +139,11 @@ def _safe_write_root_raw() -> str:
         # process's own os.environ value is safe.
         return os.environ.get("HERMES_WRITE_SAFE_ROOT", "") or ""  # scope-exempt: ImportError fallback, no secret_scope = single-profile
     scope = current_secret_scope()
-    if scope is not None and "HERMES_WRITE_SAFE_ROOT" in scope:
-        return scope["HERMES_WRITE_SAFE_ROOT"] or ""
+    if scope is not None and scope.get("HERMES_WRITE_SAFE_ROOT"):
+        # Non-empty scoped value only. An explicit empty override (KEY=) is
+        # retained by load_env_file but must NOT erase the container floor, so it
+        # falls through to os.environ below - fail closed, never allow-all.
+        return scope["HERMES_WRITE_SAFE_ROOT"]
     # Scope miss / unscoped: fall back to the container-wide floor. Not a leak - a
     # profile that set its own value hit the branch above; only profiles on the
     # container default reach here. Load-bearing invariant: under multiplex,

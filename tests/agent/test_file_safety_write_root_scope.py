@@ -50,6 +50,21 @@ def test_scope_miss_keeps_container_floor_not_allow_all(monkeypatch):
     assert fs.is_write_denied("/opt/data/profiles/x/notes.txt") is False
 
 
+def test_explicit_empty_scoped_value_keeps_container_floor(monkeypatch):
+    # BLOCKER regression: a multiplexed profile whose .env sets an EXPLICIT empty
+    # HERMES_WRITE_SAFE_ROOT= is retained by load_env_file and reaches the scope.
+    # It must NOT erase the container-wide floor (that would fail OPEN, allow-all);
+    # the empty override falls through to the /opt/data floor, same as a miss.
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "/opt/data")
+    ss.set_multiplex_active(True)
+    ss.set_secret_scope({"HERMES_WRITE_SAFE_ROOT": ""})  # explicit empty override
+    roots = fs.get_safe_write_roots()
+    assert any(r.endswith("/opt/data") for r in roots), roots
+    # The floor still confines: a path outside it stays denied.
+    assert fs.is_write_denied("/tmp/evil") is True
+    assert fs.is_write_denied("/opt/data/profiles/x/notes.txt") is False
+
+
 def test_unscoped_multiplex_keeps_container_floor(monkeypatch):
     # No scope + multiplex active: still honor the container floor, never crash,
     # never allow-all.
