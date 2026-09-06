@@ -858,6 +858,15 @@ class ToolRegistry:
     def get_toolset_for_tool(self, name: str) -> Optional[str]:
         return self._attr(name, "toolset")
 
+    def tool_owned_in_any_scope(self, name: str) -> bool:
+        """True if *name* is still registered in the global map or ANY profile overlay. Lets MCP
+        teardown keep a tool's provenance when a divergent-route peer scope still owns the same
+        tool_name string."""
+        with self._lock:
+            if name in self._tools:
+                return True
+            return any(name in m for m in self._scoped_tools.values())
+
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""
         return self._attr(name, "emoji") or default

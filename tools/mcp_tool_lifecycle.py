@@ -98,8 +98,8 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
     (its ``/reload-mcp`` must not kill other profiles') and leaves the shared loop running if
     anything else is still connected."""
     with _core._lock:
-        selected = [name for name in _core._servers if scope is None or _core._server_scope_keys.get(name) == scope]
-        servers_snapshot = [_core._servers[name] for name in selected]
+        selected = [key for key in _core._servers if scope is None or _core._server_scope_keys.get(key) == scope]
+        servers_snapshot = [_core._servers[key] for key in selected]
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still be populated here — a server that
     # failed to connect is never recorded in ``_servers`` (that is the very premise of the #50394 cooldown),
@@ -112,9 +112,9 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
                 if isinstance(result, Exception):
                     logger.debug("Error closing MCP server '%s': %s", server.name, result)
             with _core._lock:
-                for name in selected:
-                    _core._servers.pop(name, None)
-                    _core._server_scope_keys.pop(name, None)
+                for key in selected:
+                    _core._servers.pop(key, None)
+                    _core._server_scope_keys.pop(key, None)
                 _clear_connect_cooldowns()
 
         with _core._lock:

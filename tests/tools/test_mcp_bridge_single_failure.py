@@ -90,8 +90,8 @@ class TestRegisterMcpServersIsolation:
                 patch("tools.mcp_tool_registration._register_server_tools", return_value=[]), \
                 patch("tools.mcp_tool_config._filter_suspicious_mcp_servers", side_effect=lambda x: x):
             _mcp_discovery.register_mcp_servers(cfg)
-            assert "good" in mcp_mod._servers
-            assert "bad" not in mcp_mod._servers
+            assert mcp_mod._server_key("good", cfg["good"]) in mcp_mod._servers
+            assert mcp_mod._server_key("bad", cfg["bad"]) not in mcp_mod._servers
             assert _mcp_discovery._connect_cooldown_active("bad") is True
             assert "bad" in attempts
 

@@ -117,8 +117,10 @@ def _mcp_loop_running() -> bool:
 def _lookup_reconnectable_server(server_name: str, require_loop: bool = False):
     """The registered server object when it can be signalled to reconnect, else None.
     With *require_loop*, also None unless the MCP loop is running (nothing to wait on)."""
+    from tools.mcp_tool_config import _load_mcp_config
+    config = (_load_mcp_config() or {}).get(server_name)  # load config OUTSIDE the lock (heavy IO)
     with _core._lock:
-        srv = _core._servers.get(server_name)
+        srv = _core._lookup_server(server_name, config)
     ok = srv is not None and hasattr(srv, "_reconnect_event") and (_mcp_loop_running() or not require_loop)
     return srv if ok else None
 
@@ -549,8 +551,10 @@ _make_get_prompt_handler = _make_utility_handler(
 def _make_check_fn(server_name: str):
     """Connection-alive check; lazy (schema-cache registered) servers count as available."""
     def _check() -> bool:
+        from tools.mcp_tool_config import _load_mcp_config
+        config = (_load_mcp_config() or {}).get(server_name)  # load config OUTSIDE the lock (per-turn hot path)
         with _core._lock:
-            server = _core._servers.get(server_name)
+            server = _core._lookup_server(server_name, config)
             return ((server is not None and (server.session is not None or server._is_recycled_stdio()))
                     or server_name in _core._lazy_server_configs)
     return _check

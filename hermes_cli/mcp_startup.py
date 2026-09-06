@@ -6,11 +6,16 @@ import threading
 from contextlib import nullcontext
 from typing import Optional
 
-from hermes_constants import get_hermes_home_override, reset_hermes_home_override, set_hermes_home_override
+from hermes_constants import (get_hermes_home_override, hermes_home_key, reset_hermes_home_override,
+                              set_hermes_home_override)
 
 _mcp_discovery_lock = threading.Lock()
-_mcp_discovery_started = False
-_mcp_discovery_thread: Optional[threading.Thread] = None
+# Per-home discovery bookkeeping: keyed by ``hermes_home_key(get_hermes_home_override())`` so each
+# profile spawns its own discovery under its own home_override (a same-name/divergent-route server in
+# another profile is a separate connection). Single-profile: each set/dict has exactly one member and
+# behavior is identical to the old single-flag/single-thread form.
+_mcp_discovery_started: set[str] = set()
+_mcp_discovery_thread: dict[str, threading.Thread] = {}
 _mcp_discovery_deferred: Optional[threading.Timer] = None
 # Process-wide MCP server-name allowlist derived from ``-t/--toolsets``.
 # ``None`` = no filter (spawn every configured server). Set once at CLI
@@ -74,9 +79,10 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
     """
     global _mcp_discovery_started, _mcp_discovery_thread
 
+    home_key = hermes_home_key(get_hermes_home_override())
     with _mcp_discovery_lock:
-        if _mcp_discovery_started:
-            thread = _mcp_discovery_thread
+        if home_key in _mcp_discovery_started:
+            thread = _mcp_discovery_thread.get(home_key)
             if thread is not None and thread.is_alive():
                 return
             try:
@@ -88,10 +94,10 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                 "Background MCP discovery previously exited with no connected "
                 "servers; retrying discovery thread"
             )
-            _mcp_discovery_started = False
-            _mcp_discovery_thread = None
+            _mcp_discovery_started.discard(home_key)
+            _mcp_discovery_thread.pop(home_key, None)
 
-        _mcp_discovery_started = True
+        _mcp_discovery_started.add(home_key)
         if not _has_configured_mcp_servers():
             return
 
@@ -116,11 +122,10 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             finally:
                 reset_hermes_home_override(token)
                 with _mcp_discovery_lock:
-                    global _mcp_discovery_thread
-                    _mcp_discovery_thread = None
+                    _mcp_discovery_thread.pop(home_key, None)
 
         thread = threading.Thread(target=_discover, name=thread_name, daemon=True)
-        _mcp_discovery_thread = thread
+        _mcp_discovery_thread[home_key] = thread
         thread.start()
 
 
@@ -175,7 +180,7 @@ def defer_background_mcp_discovery(*, logger, thread_name: str, delay: float) ->
     """
     global _mcp_discovery_deferred
     with _mcp_discovery_lock:
-        if _mcp_discovery_started or _mcp_discovery_deferred is not None:
+        if hermes_home_key(get_hermes_home_override()) in _mcp_discovery_started or _mcp_discovery_deferred is not None:
             return
 
         def _fire() -> None:
@@ -201,6 +206,11 @@ def _start_deferred_mcp_discovery_now() -> None:
     timer.function()
 
 
+def _current_home_thread() -> "threading.Thread | None":
+    """The discovery thread for the CURRENT home_override, if any."""
+    return _mcp_discovery_thread.get(hermes_home_key(get_hermes_home_override()))
+
+
 def wait_for_mcp_discovery(timeout: "float | None" = None, *, single_query: bool = False) -> None:
     """Wait for background MCP discovery before the first tool snapshot.
 
@@ -209,14 +219,14 @@ def wait_for_mcp_discovery(timeout: "float | None" = None, *, single_query: bool
     (15s vs 1.5s) because one-shot sessions have no second turn to recover.
     """
     _start_deferred_mcp_discovery_now()
-    thread = _mcp_discovery_thread
+    thread = _current_home_thread()
     if thread is None or not thread.is_alive():
         return
     thread.join(timeout=_resolve_discovery_timeout(timeout, single_query=single_query))
 
 
 def mcp_discovery_in_flight() -> bool:
-    """True if THIS module's discovery thread is still running.
+    """True if THIS module's discovery thread (for the current home) is still running.
 
     Mirrors ``tui_gateway.entry.mcp_discovery_in_flight``; surfaces that start discovery here
     (desktop, dashboard sidecar) populate this thread, so the late-refresh scheduler consults both.
@@ -225,14 +235,14 @@ def mcp_discovery_in_flight() -> bool:
     late-refresh scheduler must consult both to decide whether a slow server's tools are still pending (see
     #51587).
     """
-    thread = _mcp_discovery_thread
+    thread = _current_home_thread()
     return thread is not None and thread.is_alive()
 
 
 def join_mcp_discovery(timeout: "float | None" = None) -> bool:
-    """Block up to ``timeout`` for THIS module's discovery; True once complete, False if still
+    """Block up to ``timeout`` for THIS module's discovery (current home); True once complete, False if still
     running. For the off-critical-path late-refresh waiter (accepts a long wait, reports outcome)."""
-    thread = _mcp_discovery_thread
+    thread = _current_home_thread()
     if thread is None:
         return True
     thread.join(timeout=timeout)

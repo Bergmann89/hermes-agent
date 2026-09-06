@@ -194,8 +194,10 @@ def _signal_reconnect(server: Any) -> bool:
 
 def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
+    from tools.mcp_tool_config import _load_mcp_config
+    config = (_load_mcp_config() or {}).get(server_name)  # load config OUTSIDE the lock (heavy IO)
     with _core._lock:
-        server = _core._servers.get(server_name)
+        server = _core._lookup_server(server_name, config)
     return server is not None and _signal_reconnect(server)
 
 
