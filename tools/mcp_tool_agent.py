@@ -98,6 +98,17 @@ def refresh_agent_mcp_tools(
     from model_tools import get_tool_definitions
     from tools.registry import registry
     enabled, disabled = _resolve_refresh_toolsets(agent, enabled_override, disabled_override)
+    # Heal this profile's scope from any already-connected MCP server BEFORE snapshotting, so a
+    # server whose live connection was opened process-wide by another profile (or by background
+    # discovery under a different home) becomes visible in THIS turn's profile scope. The helper is a
+    # no-op outside multiplex, idempotent when the scope already has the tools, and fingerprint-gated
+    # so a same-named-but-differently-routed peer connection is never borrowed. See #67605.
+    try:
+        from tools.mcp_tool_config import _load_mcp_config
+        from tools.mcp_tool_registration import register_connected_into_current_scope
+        register_connected_into_current_scope(_load_mcp_config() or {})
+    except Exception:  # noqa: BLE001
+        logger.debug("MCP per-turn scope heal skipped", exc_info=True)
     # Generation captured BEFORE the slow get_tool_definitions call (a slower caller holding an
     # OLDER set must not clobber a newer one); definitions computed OUTSIDE the lock.
     snapshot_generation = registry._generation
