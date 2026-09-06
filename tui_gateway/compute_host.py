@@ -301,7 +301,7 @@ class ComputeHost:
         key = str(frame.get("session_key") or sid)
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
         profile_home = str(frame.get("profile_home") or "")
-        session_db = home_token = secret_token = None
+        session_db = home_token = secret_token = fallback_token = None
         owns_db = False
         try:
             if profile_home:
@@ -314,6 +314,20 @@ class ComputeHost:
                 # it. A RAISING _make_agent is the one path where nothing takes it (``owns_db``).
                 session_db = acquire(Path(profile_home) / "state.db")
                 owns_db = True
+            else:
+                # Default/launch session under an active multiplexer: _make_agent reads profile
+                # credentials (ANTHROPIC_TOKEN, ...) which fail closed with no scope installed once
+                # a named-profile turn has flipped multiplex on process-wide. Bind the launch home's
+                # OWN scope, EXEMPT from fail-closed (env-injected creds survive a .env miss) —
+                # mirrors _prepare_turn_input's unconditional default branch (F2).
+                from hermes_constants import get_hermes_home, set_hermes_home_override
+                from agent.secret_scope import (
+                    build_profile_secret_scope, set_secret_scope, set_secret_scope_env_fallback)
+                launch_home = str(get_hermes_home())
+                home_token = set_hermes_home_override(launch_home)
+                with contextlib.suppress(Exception):
+                    secret_token = set_secret_scope(build_profile_secret_scope(Path(launch_home)))
+                fallback_token = set_secret_scope_env_fallback(True)
             agent = server._make_agent(
                 sid, key, session_id=key, model_override=frame.get("model_override"),
                 reasoning_config_override=frame.get("reasoning_config_override"),
@@ -335,6 +349,10 @@ class ComputeHost:
                     from agent.secret_scope import reset_secret_scope
                     reset_hermes_home_override(home_token)
                     reset_secret_scope(secret_token)
+            if fallback_token is not None:
+                with contextlib.suppress(Exception):
+                    from agent.secret_scope import reset_secret_scope_env_fallback
+                    reset_secret_scope_env_fallback(fallback_token)
         try:
             from tui_gateway.transport import bind_transport, reset_transport
             token = bind_transport(self._transport)
