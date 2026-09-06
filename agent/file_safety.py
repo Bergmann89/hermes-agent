@@ -106,10 +106,50 @@ def build_write_denied_prefixes(home: str) -> list[str]:
     return [os.path.realpath(p) + os.sep for p in paths]
 
 
+def _safe_write_root_raw() -> str:
+    """The active profile's HERMES_WRITE_SAFE_ROOT, scope-aware.
+
+    HERMES_WRITE_SAFE_ROOT is a container-wide floor (Dockerfile sets ENV
+    HERMES_WRITE_SAFE_ROOT=/opt/data, the same for every profile) that a profile
+    MAY tighten in its own .env. Under gateway multiplexing that per-profile
+    override leaked: .env loads into the shared os.environ with override=True, so
+    a plain os.getenv let whichever profile loaded last gate every profile's
+    writes (proven live: felix gated by jonas's /home/jonas).
+
+    Resolve by layer, never cross-profile:
+      * scope HIT (this profile set its own value) -> use it. Fixes the leak:
+        felix/jonas each set their own, so each hits its own scope, never the
+        other's.
+      * scope MISS or unscoped -> the container-wide floor from os.environ. A
+        profile that sets its own never reaches here, so this is the global
+        Dockerfile floor, not another profile's secret. Crucially it is NOT the
+        empty default: returning "" here would drop the /opt/data confinement and
+        fail OPEN (allow-all) for every profile that relies on the container floor
+        - worse than the leak.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope
+    except ImportError:
+        # secret_scope unavailable (ACP shim / import order): no multiplex, this
+        # process's own os.environ value is safe.
+        return os.environ.get("HERMES_WRITE_SAFE_ROOT", "") or ""  # scope-exempt: ImportError fallback, no secret_scope = single-profile
+    scope = current_secret_scope()
+    if scope is not None and "HERMES_WRITE_SAFE_ROOT" in scope:
+        return scope["HERMES_WRITE_SAFE_ROOT"] or ""
+    # Scope miss / unscoped: fall back to the container-wide floor. Not a leak - a
+    # profile that set its own value hit the branch above; only profiles on the
+    # container default reach here. Load-bearing invariant: under multiplex,
+    # hermes_cli/env_loader.py (load_hermes_dotenv) SKIPS the override=True dotenv
+    # load for routed profiles, so os.environ never holds a routed profile's
+    # HERMES_WRITE_SAFE_ROOT - only the global Dockerfile floor. If that ever
+    # changes, this read could mis-gate one profile's writes with a stale value.
+    return os.environ.get("HERMES_WRITE_SAFE_ROOT", "") or ""  # scope-exempt: container-wide floor, per-profile override handled by scope hit above
+
+
 def get_safe_write_roots() -> set[str]:
     """Resolved HERMES_WRITE_SAFE_ROOT paths (``os.pathsep``-separated list)."""
     roots: set[str] = set()
-    for path in filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)):
+    for path in filter(None, _safe_write_root_raw().split(os.pathsep)):
         with suppress(OSError, ValueError):
             roots.add(os.path.realpath(os.path.expanduser(path)))
     return roots
