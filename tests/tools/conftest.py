@@ -128,3 +128,27 @@ def disable_lazy_stt_install():
     """
     with patch("tools.transcription_tools._try_lazy_install_stt", return_value=False):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mcp_server_maps():
+    """Clear the module-global MCP connection maps after each test.
+
+    ``_servers`` is now keyed by the composite ``(name, config_fingerprint)`` (per-profile
+    connections), but many tests seed/pop by bare name; a real-adopt-path test that pops its bare
+    name leaves the composite entry behind, and a later bare-name-seeding test then sees two
+    name-matches and ``_lookup_server`` fails closed. The plain ``pytest`` invocation has no
+    module-state reset (the parallel runner does), so scrub these maps here.
+    """
+    yield
+    try:
+        from tools import mcp_tool as _core
+    except Exception:
+        return
+    for m in ("_servers", "_server_scope_keys", "_server_tool_scopes", "_mcp_tool_server_names",
+              "_server_connecting", "_server_connect_errors", "_parallel_safe_servers",
+              "_lazy_server_configs", "_lazy_server_fingerprints", "_lazy_server_tool_names"):
+        try:
+            getattr(_core, m).clear()
+        except Exception:
+            pass

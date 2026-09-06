@@ -86,7 +86,7 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
         assert len(created) == 1
         server = created[0]
         with mcp_tool._lock:
-            assert mcp_tool._servers["initial-failure"] is server
+            assert mcp_tool._lookup_server("initial-failure") is server
             assert "deterministic initial failure" in (
                 mcp_tool._server_connect_errors["initial-failure"]
             )
@@ -174,7 +174,7 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
         assert len(created) == 1
         server = created[0]
         with mcp_tool._lock:
-            assert mcp_tool._servers["recovering"] is server
+            assert mcp_tool._lookup_server("recovering") is server
             assert "backend still booting" in (
                 mcp_tool._server_connect_errors["recovering"]
             )
@@ -186,7 +186,7 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
         assert revived.wait(timeout=5), "cached parked server did not revive"
         assert len(created) == 1, "revival created a duplicate server task"
         with mcp_tool._lock:
-            assert mcp_tool._servers["recovering"] is server
+            assert mcp_tool._lookup_server("recovering") is server
             assert "recovering" not in mcp_tool._server_connect_errors
         assert state["transport_calls"] == 2
         assert server.session is not None
@@ -243,7 +243,7 @@ def test_initial_auth_failure_is_retained_and_reaped(monkeypatch, tmp_path):
             "auth failure ended the run task — the server is unrevivable"
         )
         with mcp_tool._lock:
-            assert mcp_tool._servers["auth-failure"] is server
+            assert mcp_tool._lookup_server("auth-failure") is server
             assert "terminal authentication failure" in (
                 mcp_tool._server_connect_errors["auth-failure"]
             )

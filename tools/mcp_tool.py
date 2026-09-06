@@ -397,19 +397,21 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
 
 # ---- Module-level state (every mutation under ``_lock``) ----
 
-_servers: Dict[str, MCPServerTask] = {}
+# Keyed by the COMPOSITE ``(server_name, config_fingerprint(config))``: two profiles in one process
+# configuring the SAME server name with DIFFERENT routes (e.g. ssh with different keys/ports) each get
+# their OWN live connection; a shared route (identical config -> identical fingerprint) still collapses
+# to ONE connection and heals into both scopes. The fingerprint is the only discriminator identical for
+# a shared route and different for a divergent one.
+_servers: Dict[tuple, MCPServerTask] = {}
 # Profile registry scope per live connection (None outside multiplex) so a multiplexed
-# /reload-mcp tears down only its own profile's servers.
-_server_scope_keys: Dict[str, Optional[str]] = {}
+# /reload-mcp tears down only its own profile's servers. Keyed by the composite server key.
+_server_scope_keys: Dict[tuple, Optional[str]] = {}
 # Every registry scope a server's tools were registered INTO (a shared connection is registered
 # once per served profile overlay). Used to deregister from all of them on teardown, so a
 # non-owning profile's tools are not orphaned. Distinct from _server_scope_keys, which is the single
-# owning scope that governs the CONNECTION lifecycle (/reload-mcp teardown selection).
-_server_tool_scopes: Dict[str, set] = {}
-# Connection-defining fingerprint of the config that OPENED each live connection. The cross-profile
-# heal refuses to re-register a same-named-but-differently-routed server into another profile's scope
-# (a shared connection must not be borrowed across profiles with different transports/credentials).
-_server_config_fingerprints: Dict[str, str] = {}
+# owning scope that governs the CONNECTION lifecycle (/reload-mcp teardown selection). Keyed by the
+# composite server key so a divergent-route peer's scopes are torn down independently.
+_server_tool_scopes: Dict[tuple, set] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
 # Lazy startup: servers registered from the schema cache without connecting; popped on
@@ -619,6 +621,48 @@ def _update_death_supervisor(verb: str, pgids) -> None:
             _death_supervisor = None
 
 
+def _server_key(name: str, config: dict) -> tuple:
+    """Composite ``_servers`` key: ``(name, config_fingerprint(config))``. Divergent routes for the
+    same server name get distinct keys (own connection each); a shared route collapses to one."""
+    from tools.mcp_schema_cache import config_fingerprint
+    return (name, config_fingerprint(config))
+
+
+def _key_name(key) -> str:
+    """Server name from a ``_servers`` key. Keys are composite ``(name, fp)`` in production; tolerate
+    a bare-string key (directly-seeded tests / a server adopted without a config)."""
+    return key[0] if isinstance(key, tuple) else key
+
+
+def _lookup_server(name: str, config: Optional[dict] = None):
+    """The live connection for *name* in the CURRENT profile's route.
+
+    *config* is this profile's resolved config for *name* (callers resolve it, so this stays pure and
+    never does config IO under ``_core._lock``). With a config, looks up the composite key so felix's
+    call routes to felix's connection and jonas's to jonas's, accepting on a composite miss ONLY a
+    bare-string-keyed entry (no route info: directly-seeded tests / a server adopted without a config),
+    never a foreign route. With config None, falls back to a unique name match and fails closed
+    (returns None) when a name maps to more than one live connection."""
+    if config is not None:
+        srv = _servers.get(_server_key(name, config))
+        if srv is not None:
+            return srv
+        # Known route, composite miss: accept ONLY a bare-string-keyed entry (no route info, e.g.
+        # directly-seeded tests / a server adopted without a config); NEVER a foreign tuple-keyed
+        # route belonging to another profile. Fail closed so a call cannot be dispatched against
+        # another profile's live connection/identity when this profile's own route is not present.
+        bare = [s for k, s in _servers.items() if k == name]
+        return bare[0] if len(bare) == 1 else None
+    matches = [s for k, s in _servers.items() if _key_name(k) == name]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _servers_by_name() -> Dict[str, "MCPServerTask"]:
+    """Aggregate ``{name: server}`` collapsing composite keys by name (last route wins). For the
+    aggregate-by-name status/summary readers only; the routed call path uses ``_lookup_server``."""
+    return {_key_name(k): s for k, s in _servers.items()}
+
+
 def _mcp_registry_scope() -> Optional[str]:
     """Registry scope for MCP registrations: a profile overlay under a multiplexer, else None."""
     from agent.secret_scope import is_multiplex_active
@@ -628,11 +672,18 @@ def _mcp_registry_scope() -> Optional[str]:
     return registry.current_scope_key()
 
 
-def _server_registry_scope(name: str) -> Optional[str]:
+def _server_registry_scope(name: str, config: Optional[dict] = None) -> Optional[str]:
     """Scope owning *name*'s tools: the one captured at adoption (teardown runs on the MCP
-    loop without the discovering profile's context), else the current one."""
-    if name in _server_scope_keys:
-        return _server_scope_keys[name]
+    loop without the discovering profile's context), else the current one. With *config* the
+    exact composite key is consulted; otherwise the first composite entry under this name."""
+    if config is not None:
+        key = _server_key(name, config)
+        if key in _server_scope_keys:
+            return _server_scope_keys[key]
+    else:
+        for key, scope in _server_scope_keys.items():
+            if _key_name(key) == name:
+                return scope
     return _mcp_registry_scope()
 
 

@@ -45,19 +45,22 @@ def test_register_wakes_stale_cached_server(monkeypatch, tmp_path):
     monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
     stale = _Stale("parked-srv")
     alive = _Alive("healthy-srv")
-    monkeypatch.setitem(mcp_tool._servers, "parked-srv", stale)
-    monkeypatch.setitem(mcp_tool._servers, "healthy-srv", alive)
+    cfg = {
+        "parked-srv": {"url": "http://127.0.0.1:9/mcp"},
+        "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
+    }
+    parked_key = mcp_tool._server_key("parked-srv", cfg["parked-srv"])
+    healthy_key = mcp_tool._server_key("healthy-srv", cfg["healthy-srv"])
+    monkeypatch.setitem(mcp_tool._servers, parked_key, stale)
+    monkeypatch.setitem(mcp_tool._servers, healthy_key, alive)
 
     try:
-        result = _mcp_discovery.register_mcp_servers({
-            "parked-srv": {"url": "http://127.0.0.1:9/mcp"},
-            "healthy-srv": {"url": "http://127.0.0.1:9/mcp"},
-        })
+        result = _mcp_discovery.register_mcp_servers(cfg)
         # Both cached → no new connections attempted; existing names returned.
         assert "healthy-srv__tool" in result
         # The parked (session=None) entry got a reconnect nudge; the healthy
         # one was left alone.
         assert woken == ["parked-srv"]
     finally:
-        mcp_tool._servers.pop("parked-srv", None)
-        mcp_tool._servers.pop("healthy-srv", None)
+        mcp_tool._servers.pop(parked_key, None)
+        mcp_tool._servers.pop(healthy_key, None)

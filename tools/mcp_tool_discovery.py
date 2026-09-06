@@ -126,19 +126,18 @@ def _note_connect_success(name: str) -> None:
 
 
 def _adopt_server(name: str, server: _core.MCPServerTask, config: Optional[dict] = None) -> None:
-    """Publish *server* into ``_servers`` with its owning registry scope (under ``_lock``).
+    """Publish *server* into ``_servers`` under its COMPOSITE key ``(name, fp)`` with its owning
+    registry scope (under ``_lock``).
 
-    Also records the connection-defining fingerprint of the config that opened it, so the
-    cross-profile heal (register_connected_into_current_scope) can refuse to re-register a
-    same-named-but-differently-routed server into another profile's scope (a shared connection must
-    not be borrowed across profiles that configured different transports/credentials).
+    The fingerprint component of the key is the connection-defining fingerprint of the config that
+    opened it, so the cross-profile heal (register_connected_into_current_scope) can refuse to
+    re-register a same-named-but-differently-routed server into another profile's scope (a shared
+    connection must not be borrowed across profiles that configured different transports/credentials).
     """
+    key = _core._server_key(name, config if config is not None else getattr(server, "_config", {}) or {})
     with _core._lock:
-        _core._servers[name] = server
-        _core._server_scope_keys[name] = _core._mcp_registry_scope()
-        if config is not None:
-            from tools.mcp_schema_cache import config_fingerprint
-            _core._server_config_fingerprints[name] = config_fingerprint(config)
+        _core._servers[key] = server
+        _core._server_scope_keys[key] = _core._mcp_registry_scope()
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
@@ -149,10 +148,10 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     See #50394.
     """
     with _core._lock:
-        server = _core._servers.get(server_name)
+        config = _core._lazy_server_configs.get(server_name)
+        server = _core._lookup_server(server_name, config)
         if server is not None and server.session is not None:
             return True
-        config = _core._lazy_server_configs.get(server_name)
         if (not config or _connect_cooldown_active(server_name)
                 or server_name in _core._server_connecting):
             return False
@@ -172,14 +171,14 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
         _core._lazy_server_configs.pop(server_name, None)
         stale_fingerprint = _core._lazy_server_fingerprints.pop(server_name, None)
         cached_names = _core._lazy_server_tool_names.pop(server_name, None) or []
-        server = _core._servers.get(server_name)
+        server = _core._lookup_server(server_name, config)
         live_names = set(getattr(server, "_registered_tool_names", []) or [])
     # The cached manifest may advertise tools the live server no longer serves.
     phantom_names = [n for n in cached_names if n not in live_names]
     if phantom_names:
         from tools.registry import registry
         for tool_name in phantom_names:
-            registry.deregister(tool_name, scope=_core._server_registry_scope(server_name))
+            registry.deregister(tool_name, scope=_core._server_registry_scope(server_name, config))
             _registration._forget_mcp_tool_server(tool_name)
         logger.info("MCP server '%s': deregistered %d phantom cached tool(s) not served live (stale schema-cache "
                     "fingerprint %s): %s", server_name, len(phantom_names), stale_fingerprint, ", ".join(phantom_names))
@@ -193,9 +192,21 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
     Also the single first-use connect point for lazy (schema-cache registered) servers, so raw tool calls
     AND the resource/prompt utility handlers all trigger the deferred spawn (#56832).
     """
+    from tools.mcp_tool_config import _load_mcp_config
+    own_config = (_load_mcp_config() or {}).get(server_name)  # resolve THIS profile's route OUTSIDE the lock
     with _core._lock:
-        server = _core._servers.get(server_name)
         is_lazy = server_name in _core._lazy_server_configs
+        lazy_config = _core._lazy_server_configs.get(server_name)
+        server = _core._lookup_server(server_name, own_config or lazy_config)
+    # ponytail: _lazy_server_configs is name-keyed (v1 scope-out). Under multiplex a divergent-route
+    # peer profile could hold the lazy slot, so fail closed when the lazy config's route does not match
+    # THIS profile's own resolved route -- never spawn/route a lazy call against another profile's
+    # connection. Re-key the lazy maps composite if lazy+divergent+multiplex becomes a live case.
+    if is_lazy and lazy_config is not None:
+        from agent.secret_scope import is_multiplex_active
+        if is_multiplex_active():
+            if own_config is None or _core._server_key(server_name, own_config) != _core._server_key(server_name, lazy_config):
+                return None
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
     elif server is not None and server.session is None and server._is_recycled_stdio():
@@ -203,7 +214,7 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
     else:
         return server
     with _core._lock:
-        return _core._servers.get(server_name)
+        return _core._lookup_server(server_name, own_config or lazy_config)
 
 
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
@@ -247,12 +258,16 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
         # Only attempt servers that aren't already connected (or currently connecting) and are enabled.
         # Checking ``_server_connecting`` prevents duplicate subprocess spawns when ``discover_mcp_tools()``
         # is called from multiple entry-points before the first batch finishes (#58862).
+        # Dedup by the COMPOSITE (name, fp): a divergent-route same-name server (different key) is NOT
+        # collapsed and spawns its own connection; only an identical route (same key) is skipped.
         new_servers = {
             k: v for k, v in servers.items()
-            if k not in _core._servers and k not in connecting and k not in _core._lazy_server_configs
+            if _core._server_key(k, v) not in _core._servers and k not in connecting
+            and k not in _core._lazy_server_configs
             and _enabled(v) and not _connect_cooldown_active(k)}
-        stale_cached = [_core._servers[k] for k in servers
-                        if k in _core._servers and getattr(_core._servers[k], "session", None) is None]
+        stale_cached = [_core._servers[_core._server_key(k, v)] for k, v in servers.items()
+                        if _core._server_key(k, v) in _core._servers
+                        and getattr(_core._servers[_core._server_key(k, v)], "session", None) is None]
         _core._server_connecting.update(new_servers)
         current_scope = _core._mcp_registry_scope()
         for srv_name in new_servers:
@@ -348,8 +363,9 @@ def _run_discovery_pass(new_servers: Dict[str, dict]) -> None:
 def _connected_summary(names, *, lazy_tools: int = 0, lazy_servers: int = 0) -> Tuple[int, int, int]:
     """(tool count, connected count, failed count) for candidate names, plus lazy servers."""
     with _core._lock:
-        connected = [n for n in names if n in _core._servers and n not in _core._server_connect_errors]
-        tool_count = sum(len(getattr(_core._servers[n], "_registered_tool_names", [])) for n in connected)
+        by_name = _core._servers_by_name()
+        connected = [n for n in names if n in by_name and n not in _core._server_connect_errors]
+        tool_count = sum(len(getattr(by_name[n], "_registered_tool_names", [])) for n in connected)
     failed = len(names) - len(connected)
     return tool_count + lazy_tools, len(connected) + lazy_servers, failed
 
@@ -451,7 +467,8 @@ def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[st
         with _core._lock:
             connecting = set(_core._server_connecting)
             new_server_names = [name for name, cfg in servers.items()
-                                if name not in _core._servers and name not in connecting and _enabled(cfg)]
+                                if _core._server_key(name, cfg) not in _core._servers
+                                and name not in connecting and _enabled(cfg)]
         tool_names = register_mcp_servers(servers)
         if new_server_names:
             _log_summary("  MCP:", new_server_names)
@@ -483,10 +500,11 @@ def get_mcp_status(configured: Optional[Dict[str, dict]] = None, *, include_runt
         def visible(name: str) -> bool:
             # Runtime state belongs to the profile that adopted it; under a multiplexer only that
             # profile's view may show it, and ``include_runtime=False`` hides the launch profile's
-            # servers from a status read scoped to a different profile.
-            return include_runtime and _core._server_scope_keys.get(name, None) == current_scope
+            # servers from a status read scoped to a different profile. Scope is resolved by name
+            # across composite (name, fingerprint) keys via _server_registry_scope.
+            return include_runtime and _core._server_registry_scope(name) == current_scope
 
-        active_servers = {n: s for n, s in _core._servers.items() if visible(n)}
+        active_servers = {n: s for n, s in _core._servers_by_name().items() if visible(n)}
         connecting = {n for n in _core._server_connecting if visible(n)}
         connect_errors = {n: e for n, e in _core._server_connect_errors.items() if visible(n)}
 

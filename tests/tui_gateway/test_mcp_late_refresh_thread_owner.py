@@ -26,6 +26,12 @@ import pytest
 
 import hermes_cli.mcp_startup as startup
 import tui_gateway.entry as entry
+from hermes_constants import hermes_home_key, get_hermes_home_override
+
+
+def _startup_slot(thread):
+    """Wrap *thread* in the per-home dict shape mcp_startup now uses (current home key)."""
+    return {hermes_home_key(get_hermes_home_override()): thread}
 
 
 @pytest.fixture
@@ -34,7 +40,7 @@ def clean_discovery_globals():
     saved_entry = entry._mcp_discovery_thread
     saved_startup = startup._mcp_discovery_thread
     entry._mcp_discovery_thread = None
-    startup._mcp_discovery_thread = None
+    startup._mcp_discovery_thread = {}
     try:
         yield
     finally:
@@ -55,14 +61,14 @@ def test_entry_in_flight_sees_startup_thread(clean_discovery_globals):
     scheduler does not bail (the #51587 bug).
     """
     stop = threading.Event()
-    startup._mcp_discovery_thread = _alive_thread(stop)
+    startup._mcp_discovery_thread = _startup_slot(_alive_thread(stop))
     try:
         # Entry's own thread is None, but the startup thread is alive.
         assert entry._mcp_discovery_thread is None
         assert entry.mcp_discovery_in_flight() is True
     finally:
         stop.set()
-        startup._mcp_discovery_thread.join(timeout=2.0)
+        startup._current_home_thread().join(timeout=2.0)
 
     # After the thread exits, neither owner is in flight.
     assert entry.mcp_discovery_in_flight() is False
@@ -81,7 +87,7 @@ def test_startup_module_exposes_in_flight_helpers(clean_discovery_globals):
 
     stop = threading.Event()
     t = _alive_thread(stop)
-    startup._mcp_discovery_thread = t
+    startup._mcp_discovery_thread = _startup_slot(t)
     try:
         assert startup.mcp_discovery_in_flight() is True
         assert startup.join_mcp_discovery(timeout=0.1) is False
