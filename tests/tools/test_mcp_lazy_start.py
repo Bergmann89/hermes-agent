@@ -305,7 +305,8 @@ class TestLazyFirstUseConnect:
              patch.object(_mcp_discovery, "_record_connect_failure") as mock_record:
             assert _mcp_discovery._ensure_lazy_server_connected("playwright") is False
 
-        mock_record.assert_called_once_with("playwright")
+        # Connect-cooldown state is keyed by the route identity (name, fingerprint), not the bare name.
+        mock_record.assert_called_once_with(mcp._server_key("playwright", {"command": "npx", "lazy": True}))
         # Config retained so a later call can retry after cooldown.
         assert "playwright" in mcp._lazy_server_configs
 

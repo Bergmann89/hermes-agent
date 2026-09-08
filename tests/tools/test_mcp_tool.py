@@ -289,8 +289,9 @@ class TestMCPStatus:
             mcp_tool._servers.clear()
             mcp_tool._server_connecting.clear()
             mcp_tool._server_connect_errors.clear()
-            mcp_tool._server_connecting.add("connecting")
-            mcp_tool._server_connect_errors["failed"] = "Connection closed"
+            # Connecting/error state is keyed by the route identity (name, fingerprint).
+            mcp_tool._server_connecting.add(mcp_tool._server_key("connecting", {"command": "slow-mcp"}))
+            mcp_tool._server_connect_errors[mcp_tool._server_key("failed", {"command": "bad-mcp"})] = "Connection closed"
 
         try:
             statuses = {
@@ -1129,7 +1130,7 @@ class TestToolsetInjection:
             # per-worker-session discovery passes). Expire that cooldown to
             # simulate the retry window having elapsed.
             import tools.mcp_tool as _mcp_mod
-            _mcp_mod._server_connect_retry_after.pop("broken", None)
+            _mcp_mod._server_connect_retry_after.pop(_mcp_mod._server_key("broken", fake_config["broken"]), None)
 
             # Next call after the cooldown: should retry broken, skip good
             result2 = discover_mcp_tools()
@@ -2831,13 +2832,14 @@ class TestRegisterMcpServers:
     def test_skips_servers_already_connecting(self):
         """Servers in _server_connecting must not be spawned again (#58862)."""
         from tools.mcp_tool_discovery import register_mcp_servers
-        from tools.mcp_tool import _servers, _server_connecting
+        from tools.mcp_tool import _servers, _server_connecting, _server_key
         from tools.mcp_tool_loop import _ensure_mcp_loop
 
         fake_config = {"my_srv": {"command": "npx", "args": ["test"]}}
+        my_key = _server_key("my_srv", fake_config["my_srv"])
 
-        # Simulate a prior call that started connecting but hasn't finished
-        _server_connecting.add("my_srv")
+        # Simulate a prior call that started connecting but hasn't finished (route-keyed).
+        _server_connecting.add(my_key)
         connect_calls = []
 
         async def fake_register(name, cfg):
@@ -2862,7 +2864,7 @@ class TestRegisterMcpServers:
             )
             assert result == []
         finally:
-            _server_connecting.discard("my_srv")
+            _server_connecting.discard(my_key)
             _servers.pop("my_srv", None)
 
     def test_clears_stale_connecting_on_timeout(self):
