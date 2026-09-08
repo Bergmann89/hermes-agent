@@ -628,6 +628,16 @@ def _server_key(name: str, config: dict) -> tuple:
     return (name, config_fingerprint(config))
 
 
+def _route_key(name: str, config: Optional[dict] = None):
+    """Route identity for every per-route map (connection, connect-cooldown, circuit breaker, trust).
+
+    Composite ``(name, config_fingerprint(config))`` when THIS route's config is known, so divergent
+    same-name routes across profiles get isolated state; the bare *name* when no config is available
+    (directly-seeded tests, configless callers) — mirroring ``_lookup_server``'s bare tolerance. An
+    empty config ``{}`` is treated as configless (bare) so seeded stubs stay findable."""
+    return _server_key(name, config) if config else name
+
+
 def _key_name(key) -> str:
     """Server name from a ``_servers`` key. Keys are composite ``(name, fp)`` in production; tolerate
     a bare-string key (directly-seeded tests / a server adopted without a config)."""

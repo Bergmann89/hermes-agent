@@ -117,7 +117,7 @@ class MCPServerTransportMixin:
         await self._discover_tools()
         self._ready.set()
         self._ever_connected = True
-        _core._reset_server_error(self.name)
+        _core._reset_server_error(_core._route_key(self.name, self._config or {}))
         # Session is live again: clear any breaker state from a prior outage so the first call after
         # recovery isn't gated on a stale consecutive-failure count (#16788).
         # A completed handshake alone is NOT proof of health: a flapping transport can handshake fine and
@@ -455,4 +455,4 @@ class MCPServerTransportMixin:
         self._registered_tool_names = _registration._register_server_tools(self.name, self, self._config)
         with _core._lock:  # a retained initial-failure server that just published tools has recovered
             if _core._servers.get(_core._server_key(self.name, self._config or {})) is self:
-                _core._server_connect_errors.pop(self.name, None)
+                _core._server_connect_errors.pop(_core._route_key(self.name, self._config or {}), None)

@@ -48,11 +48,14 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
 
 
 def _record_tool_trust_metadata(server_name: str, config: dict, tools: List[Any]) -> None:
-    """Capture per-server trust and per-tool readOnlyHint at discovery — the security boundary: the call-time gate
-    classifies from data we control, never re-read server-supplied state."""
+    """Capture per-ROUTE trust and per-tool readOnlyHint at discovery — the security boundary: the call-time gate
+    classifies from data we control, never re-read server-supplied state. Keyed by the route identity
+    ``(name, fingerprint)`` so a later trust:full same-name route in another profile cannot overwrite an
+    existing trust:untrusted route's classification and strip its gate."""
+    key = _core._route_key(server_name, config)
     with _core._lock:
-        _core._server_trust_levels[server_name] = _normalize_server_trust((config or {}).get("trust"))
-        hints = _core._tool_read_only_hints.setdefault(server_name, {})
+        _core._server_trust_levels[key] = _normalize_server_trust((config or {}).get("trust"))
+        hints = _core._tool_read_only_hints.setdefault(key, {})
         hints.update({t.name: _annotation_read_only_hint(t) for t in tools if getattr(t, "name", None)})
 
 
@@ -178,9 +181,10 @@ class _Candidate:
 
 
 def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[[str], bool],
-                     tool_timeout) -> List[_Candidate]:
+                     tool_timeout, config: Optional[dict] = None) -> List[_Candidate]:
     """Native tools (live SDK objects or cache stand-ins) -> candidates. The injection scan runs on
-    BOTH paths: the cache file is user-writable JSON."""
+    BOTH paths: the cache file is user-writable JSON. ``config`` is threaded into the handler so its
+    trust gate / circuit breaker key to this exact route."""
     out: List[_Candidate] = []
     for t in tools:
         if not should_register(t.name):
@@ -188,19 +192,19 @@ def _tool_candidates(name: str, tools: Iterable[Any], should_register: Callable[
             continue
         _schema._scan_mcp_description(name, t.name, t.description or "")
         schema = _schema._convert_mcp_schema(name, t)
-        handler = _handlers._make_tool_handler(name, t.name, tool_timeout)
+        handler = _handlers._make_tool_handler(name, t.name, tool_timeout, config)
         out.append(_Candidate(schema["name"], f"tool {t.name!r}", schema, handler))
     return out
 
 
-def _utility_candidates(name: str, entries: Iterable[Any], tool_timeout) -> List[_Candidate]:
+def _utility_candidates(name: str, entries: Iterable[Any], tool_timeout, config: Optional[dict] = None) -> List[_Candidate]:
     """``{schema, handler_key}`` rows (live selection or cache) -> candidates; malformed rows dropped."""
     out: List[_Candidate] = []
     for raw in entries:
         schema, key = (raw.get("schema"), raw.get("handler_key")) if isinstance(raw, dict) else (None, None)
         if isinstance(schema, dict) and key in _UTILITY_HANDLER_FACTORIES and schema.get("name"):
             out.append(_Candidate(schema["name"], f"{_UTILITY_ORIGIN_PREFIX}{key!r}", schema,
-                                  _UTILITY_HANDLER_FACTORIES[key](name, tool_timeout)))
+                                  _UTILITY_HANDLER_FACTORIES[key](name, tool_timeout, config)))
     return out
 
 
@@ -325,8 +329,8 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     ``toolsets.TOOLSETS``; lossy normalization collisions (``read-file``/``read_file``) fail closed."""
     should_register = _make_tool_filter(name, config)
     _record_tool_trust_metadata(name, config, server._tools)
-    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout)
-    candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
+    candidates = _tool_candidates(name, server._tools, should_register, server.tool_timeout, config)
+    candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout, config)
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
         check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(name, config), lazy=False,
@@ -382,13 +386,19 @@ def register_connected_into_current_scope(servers: dict) -> int:
             logger.warning("MCP server '%s': this profile's config routes differently than the live "
                            "connection (fingerprint mismatch) — not sharing it across profiles", name)
             continue  # fail closed: do not borrow another profile's connection/identity
+        # Trust metadata (_server_trust_levels / _tool_read_only_hints) is intentionally NOT re-recorded
+        # here: it is keyed by the route identity (name, fingerprint) and the owning registration already
+        # recorded it. The fingerprint gate above guarantees this profile's route_key is identical, so the
+        # owner's classification applies unchanged. Log the match so a future divergence is diagnosable.
+        logger.debug("MCP server '%s': route fingerprint %s matches the live connection's — reusing the "
+                     "owner's trust classification (not re-recording)", name, owning_fp)
         if registry.get_tool_names_for_toolset(f"mcp-{name}"):
             continue  # this scope already sees the tools
         # Re-register the live session's tools into THIS scope (not the first-capture owning scope).
         names = _register_candidates(
             name, _resolve_name_collisions(name, _tool_candidates(
-                name, server._tools, _make_tool_filter(name, config), server.tool_timeout)
-                + _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)),
+                name, server._tools, _make_tool_filter(name, config), server.tool_timeout, config)
+                + _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout, config)),
             check_fn=_make_check_fn(name), scope=lambda: scope, lazy=False,
             server_key=_core._server_key(name, config))
         if names:
@@ -415,8 +425,8 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     tool_timeout = _resolve_tool_timeout(config)
     cached_tools = _cached_tools(tools_from_cache_entry(entry))
     _record_tool_trust_metadata(name, config, cached_tools)
-    candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
-    candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
+    candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout, config)
+    candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout, config)
     registered = _register_candidates(
         name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)
     if registered:

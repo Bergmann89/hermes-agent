@@ -35,11 +35,14 @@ _STDIO_DIED_AGAIN_MSG = (
     "cleanly — do NOT retry this tool; ask the user to check the server's command and its stderr log.")
 
 
-def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+def _trust_gate_check(server_name: str, tool_name: str, route_key=None) -> Optional[str]:
     """Approval gate for write-capable tools on ``trust: untrusted`` servers. None to proceed,
-    else a ``tool_error``. Fail-closed: approval-system errors block."""
-    if (_core._server_trust_levels.get(server_name, _core._TRUST_FULL) != _core._TRUST_UNTRUSTED
-            or _core._tool_read_only_hints.get(server_name, {}).get(tool_name) is True):
+    else a ``tool_error``. Fail-closed: approval-system errors block. Trust/readOnlyHint are keyed by
+    the route identity (``route_key``) so a later trust:full same-name route cannot strip an existing
+    trust:untrusted route's gate; a missing route entry defaults to full ONLY for that exact route."""
+    key = route_key if route_key is not None else server_name
+    if (_core._server_trust_levels.get(key, _core._TRUST_FULL) != _core._TRUST_UNTRUSTED
+            or _core._tool_read_only_hints.get(key, {}).get(tool_name) is True):
         return None
     try:  # lazy: tools.approval routes the prompt to whichever surface owns the session
         from tools.approval_prompt import request_elicitation_consent
@@ -61,11 +64,14 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
                       f"'{server_name}'. The command was NOT run. Do not retry without explicit user direction.")
 
 
-def _check_circuit_breaker(server_name: str) -> Optional[str]:
+def _check_circuit_breaker(server_name: str, route_key=None) -> Optional[str]:
     """Open-breaker error, or None when calls may proceed. After the cooldown the breaker is
-    half-open: the next call probes; success resets, failure re-bumps and re-arms the cooldown."""
-    failures = _core._server_error_counts.get(server_name, 0)
-    age = time.monotonic() - _core._server_breaker_opened_at.get(server_name, 0.0)
+    half-open: the next call probes; success resets, failure re-bumps and re-arms the cooldown. The
+    breaker is keyed by route identity so a failure on one profile's route never opens another
+    profile's same-name route."""
+    key = route_key if route_key is not None else server_name
+    failures = _core._server_error_counts.get(key, 0)
+    age = time.monotonic() - _core._server_breaker_opened_at.get(key, 0.0)
     if failures < _core._CIRCUIT_BREAKER_THRESHOLD or age >= _core._CIRCUIT_BREAKER_COOLDOWN_SEC:
         return None
     return tool_error(f"MCP server '{server_name}' is unreachable after {failures} consecutive failures. "
@@ -73,17 +79,18 @@ def _check_circuit_breaker(server_name: str) -> Optional[str]:
                       f"this tool yet — use alternative approaches or ask the user to check the MCP server.")
 
 
-def _acquire_call_server(server_name: str, tool_timeout: float):
+def _acquire_call_server(server_name: str, tool_timeout: float, route_key=None):
     """``(server, None)`` when a call may be dispatched, else ``(None, error)``. No session: a
     reconnect may be completing, so wait briefly before a breaker strike; still down -> ask the
     server task to rebuild (probing a dead transport would re-arm the breaker forever)."""
     from tools import mcp_tool_discovery as _discovery  # lazy: discovery -> registration -> handlers cycle
+    key = route_key if route_key is not None else server_name
     not_connected = tool_error(f"MCP server '{server_name}' is not connected")
     server = _discovery._get_connected_server_for_call(server_name)
     wait = min(5.0, float(tool_timeout or 5.0))
     if server and (server.session or _loop._wait_for_server_session_ready(server, timeout=wait)):
         return server, None
-    _core._bump_server_error(server_name)
+    _core._bump_server_error(key)
     if server and _loop._signal_reconnect(server):
         return None, tool_error(f"MCP server '{server_name}' transport is down; reconnect requested. Do NOT retry this "
                                 f"tool immediately — give it a few seconds to come back.")
@@ -98,15 +105,16 @@ def _result_is_error(result) -> bool:
         return False
 
 
-def _record_call_outcome(server_name: str, result) -> Any:
+def _record_call_outcome(server_name: str, result, route_key=None) -> Any:
     """Breaker bookkeeping: an error payload from the tool itself still counts as a strike."""
-    (_core._bump_server_error if _result_is_error(result) else _core._reset_server_error)(server_name)
+    key = route_key if route_key is not None else server_name
+    (_core._bump_server_error if _result_is_error(result) else _core._reset_server_error)(key)
     return result
 
 
-def _strike(server_name: str, message: str, **extra) -> str:
+def _strike(server_name: str, message: str, route_key=None, **extra) -> str:
     """Breaker strike + the ``tool_error`` payload for *message*."""
-    _core._bump_server_error(server_name)
+    _core._bump_server_error(route_key if route_key is not None else server_name)
     return tool_error(message, **extra)
 
 
@@ -125,7 +133,7 @@ def _lookup_reconnectable_server(server_name: str, require_loop: bool = False):
     return srv if ok else None
 
 
-def _retry_once(server_name: str, retry_call, op_description: str, what: str):
+def _retry_once(server_name: str, retry_call, op_description: str, what: str, route_key=None):
     """Re-run ``retry_call`` after a recovery step. Returns the result (closing the breaker)
     when it is not an error payload; None when the retry raised or errored (caller falls through)."""
     try:
@@ -135,11 +143,11 @@ def _retry_once(server_name: str, retry_call, op_description: str, what: str):
         return None
     if _result_is_error(result):
         return None
-    _core._reset_server_error(server_name)
+    _core._reset_server_error(route_key if route_key is not None else server_name)
     return result
 
 
-def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str):
+def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str, route_key=None):
     """OAuth recovery + one retry; None when *exc* is not an auth error. ``handle_401`` decides
     viability; if viable, signal a reconnect (fresh credentials), wait ready, retry once. Any
     failure returns the structured ``needs_reauth`` error so the model stops refreshing."""
@@ -157,14 +165,14 @@ def _handle_auth_error_and_retry(server_name: str, exc: BaseException, retry_cal
         # retry success (else a failing retry pins it open forever).
         if srv is not None and _loop._signal_reconnect_and_wait(
                 server_name, srv, op_description=f"{op_description} after OAuth recovery", timeout=15):
-            _core._reset_server_error(server_name)
-        result = _retry_once(server_name, retry_call, op_description, "auth recovery")
+            _core._reset_server_error(route_key if route_key is not None else server_name)
+        result = _retry_once(server_name, retry_call, op_description, "auth recovery", route_key)
         if result is not None:
             return result
-    return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name), needs_reauth=True, server=server_name)
+    return _strike(server_name, _NEEDS_REAUTH_MSG.format(s=server_name), route_key=route_key, needs_reauth=True, server=server_name)
 
 
-def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str):
+def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retry_call, op_description: str, route_key=None):
     """Transport reconnect + one retry on session expiry; None to fall through. Skips
     ``handle_401``: the token is valid, only the server-side session is stale.
 
@@ -183,14 +191,14 @@ def _handle_session_expired_and_retry(server_name: str, exc: BaseException, retr
         logger.warning("MCP server '%s': reconnect did not ready within 15s after session-expired error; "
                        "falling through to error response.", server_name)
         return None
-    return _retry_once(server_name, retry_call, op_description, "session reconnect")
+    return _retry_once(server_name, retry_call, op_description, "session reconnect", route_key)
 
 
 class _StdioChildExited(RuntimeError):
     """Stdio subprocess gone when (or while) a call ran. Deliberately NOT a TimeoutError."""
 
 
-def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry_call, op_description: str):
+def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry_call, op_description: str, route_key=None):
     """Respawn a dead stdio child and retry once; None if not our error. Never spawns itself: it
     sets ``_reconnect_event`` and waits, so spawn frequency stays governed by ``run()``'s
     rapid-drop budget. Single-shot: a child that dies again reports and stops.
@@ -213,27 +221,29 @@ def _handle_stdio_child_exited_and_retry(server_name: str, exc: Exception, retry
         else:  # No MCP loop to wait on (non-async adapters, tests): still request the respawn.
             _loop._signal_reconnect(srv)
     if not reconnected:
-        return _strike(server_name, _STDIO_NO_RESPAWN_MSG.format(s=server_name, t=_core._STDIO_RESPAWN_WAIT_SEC))
+        return _strike(server_name, _STDIO_NO_RESPAWN_MSG.format(s=server_name, t=_core._STDIO_RESPAWN_WAIT_SEC), route_key=route_key)
     try:
-        return _record_call_outcome(server_name, retry_call())
+        return _record_call_outcome(server_name, retry_call(), route_key)
     except _StdioChildExited as retry_exc:
         # Died again right after respawn: broken server; run()'s budget takes it to the park.
         logger.warning("MCP server '%s': %s stdio subprocess exited again right after respawn (%s); not retrying "
                        "further.", server_name, op_description, retry_exc)
-        return _strike(server_name, _STDIO_DIED_AGAIN_MSG.format(s=server_name))
+        return _strike(server_name, _STDIO_DIED_AGAIN_MSG.format(s=server_name), route_key=route_key)
     except Exception as retry_exc:
         logger.warning("MCP %s/%s retry after stdio respawn failed: %s", server_name, op_description, retry_exc)
         return _strike(server_name, _sanitize_error(
             f"MCP call failed after respawning the stdio subprocess for '{server_name}': "
-            f"{type(retry_exc).__name__}: {_exc_str(retry_exc)}"))
+            f"{type(retry_exc).__name__}: {_exc_str(retry_exc)}"), route_key=route_key)
 
 
 def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float, recoverers,
-              on_final_failure: Callable[[BaseException], None], record_outcome: bool = False) -> str:
+              on_final_failure: Callable[[BaseException], None], record_outcome: bool = False,
+              route_key=None) -> str:
     """Mark the call started on *server* (doubles may lack ``mark_tool_call``), run coroutine function *call*
-    on the MCP loop and, on failure, walk ``recoverers`` (``(server_name, exc, retry_call, op) -> Optional[str]``,
-    None = not its kind; order matters). Unrecovered exceptions go through ``on_final_failure`` and become the
-    generic call-failed error. ``record_outcome`` applies breaker bookkeeping to the FIRST attempt only."""
+    on the MCP loop and, on failure, walk ``recoverers`` (``(server_name, exc, retry_call, op, route_key) ->
+    Optional[str]``, None = not its kind; order matters). Unrecovered exceptions go through ``on_final_failure``
+    and become the generic call-failed error. ``record_outcome`` applies breaker bookkeeping to the FIRST
+    attempt only. ``route_key`` keys the circuit breaker to this exact route (per-profile isolation)."""
     if callable(getattr(server, "mark_tool_call", None)):
         server.mark_tool_call()
 
@@ -242,12 +252,12 @@ def _dispatch(server_name: str, server: Any, op: str, call, tool_timeout: float,
 
     try:
         result = call_once()
-        return _record_call_outcome(server_name, result) if record_outcome else result
+        return _record_call_outcome(server_name, result, route_key) if record_outcome else result
     except InterruptedError:
         return tool_error("MCP call interrupted: user sent a new message")
     except Exception as exc:
         for recover in recoverers:
-            recovered = recover(server_name, exc, call_once, op)
+            recovered = recover(server_name, exc, call_once, op, route_key)
             if recovered is not None:
                 return recovered
         on_final_failure(exc)
@@ -418,16 +428,22 @@ def _render_call_tool_result(result, server_name: str) -> str:
         return json.dumps({"result": text_result}, ensure_ascii=False)
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
-    """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop."""
+def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float, config: Optional[dict] = None):
+    """Sync registry handler (``handler(args_dict, **kwargs) -> str``) calling an MCP tool via the background loop.
+
+    ``config`` is THIS route's resolved config; the trust gate and circuit breaker are keyed by the
+    route identity (``(name, fingerprint)``) so a same-name route in another profile scope cannot
+    remove this route's trust gate or open this route's breaker (and vice versa). Configless callers
+    (directly-seeded tests) fall back to the bare server name."""
     op = f"tools/call {tool_name}"
+    route_key = _core._route_key(server_name, config)
 
     def _handler(args: dict, **kwargs) -> str:
         # Security boundary: untrusted-server write tools need approval before ANY transport work (incl. lazy spawn).
-        error = _trust_gate_check(server_name, tool_name) or _check_circuit_breaker(server_name)
+        error = _trust_gate_check(server_name, tool_name, route_key) or _check_circuit_breaker(server_name, route_key)
         if error is not None:
             return error
-        server, error = _acquire_call_server(server_name, tool_timeout)
+        server, error = _acquire_call_server(server_name, tool_timeout, route_key)
         if server is None:
             return error
 
@@ -443,12 +459,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             return _render_call_tool_result(result, server_name)
 
         def _on_failure(exc):
-            _core._bump_server_error(server_name)
+            _core._bump_server_error(route_key)
             logger.error("MCP tool %s/%s call failed: %s", server_name, tool_name, exc)
         return _dispatch(
             server_name, server, op, _call, tool_timeout,
             (_handle_stdio_child_exited_and_retry, _handle_auth_error_and_retry, _handle_session_expired_and_retry),
-            _on_failure, record_outcome=True)
+            _on_failure, record_outcome=True, route_key=route_key)
     return _handler
 
 
@@ -456,7 +472,9 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
     """``(server_name, tool_timeout) -> sync handler`` for one utility tool: ``rpc(session, args,
     server_name)`` awaited under ``_rpc_lock``, ``render(result, server_name)`` -> JSON-able
     payload, ``required`` validated before any transport work."""
-    def _factory(server_name: str, tool_timeout: float):
+    def _factory(server_name: str, tool_timeout: float, config: Optional[dict] = None):
+        route_key = _core._route_key(server_name, config)
+
         def _handler(args: dict, **kwargs) -> str:
             from tools import mcp_tool_discovery as _discovery  # lazy: import cycle
             server = _discovery._get_connected_server_for_call(server_name)
@@ -472,7 +490,8 @@ def _make_utility_handler(op: str, log_label: str, rpc, render, required: Option
             return _dispatch(
                 server_name, server, op, _call, tool_timeout,
                 (_handle_auth_error_and_retry, _handle_session_expired_and_retry),
-                lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc))
+                lambda exc: logger.error("MCP %s/%s failed: %s", server_name, log_label, exc),
+                route_key=route_key)
         return _handler
     return _factory
 
