@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import contextvars
 import threading
 from contextlib import nullcontext
 from typing import Optional
 
-from hermes_constants import (get_hermes_home_override, hermes_home_key, reset_hermes_home_override,
-                              set_hermes_home_override)
-
+from hermes_constants import get_hermes_home_override, hermes_home_key
 _mcp_discovery_lock = threading.Lock()
 # Per-home discovery bookkeeping: keyed by ``hermes_home_key(get_hermes_home_override())`` so each
 # profile spawns its own discovery under its own home_override (a same-name/divergent-route server in
@@ -101,15 +100,17 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
         if not _has_configured_mcp_servers():
             return
 
-        # Re-install the caller's context-local HERMES_HOME override (multi-profile dashboard/desktop
-        # backends) inside the thread: ContextVars don't propagate into bare threads, so a session
-        # switched to profile X would otherwise discover the LAUNCH profile's mcp_servers.
-        # The config gate above already runs on the caller's thread, so it sees the same override. See
-        # #67605.
-        home_override = get_hermes_home_override()
+        # ContextVars don't propagate into a bare thread, so snapshot the caller's context and run
+        # discovery inside it. This carries not just the HERMES_HOME override (multi-profile
+        # dashboard/desktop backends — a session switched to profile X must discover X's mcp_servers,
+        # not the LAUNCH profile's, see #67605) but ALSO the profile's secret scope + env-fallback flag
+        # (agent.secret_scope). Without the scope, a named profile's credentialed mcp_servers hit
+        # get_secret() under active multiplexing with no scope installed, raising UnscopedSecretError,
+        # which _load_mcp_config() swallows -> zero tools. The config gate above already runs on the
+        # caller's thread, so it sees the same context.
+        ctx = contextvars.copy_context()
 
         def _discover() -> None:
-            token = set_hermes_home_override(home_override)
             try:
                 _discover_mcp_tools_without_interactive_oauth()
                 try:
@@ -120,11 +121,10 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             except Exception:
                 logger.debug("Background MCP tool discovery failed", exc_info=True)
             finally:
-                reset_hermes_home_override(token)
                 with _mcp_discovery_lock:
                     _mcp_discovery_thread.pop(home_key, None)
 
-        thread = threading.Thread(target=_discover, name=thread_name, daemon=True)
+        thread = threading.Thread(target=lambda: ctx.run(_discover), name=thread_name, daemon=True)
         _mcp_discovery_thread[home_key] = thread
         thread.start()
 
