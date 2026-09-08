@@ -103,21 +103,25 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
     (its ``/reload-mcp`` must not kill other profiles') and leaves the shared loop running if
     anything else is still connected."""
     with _core._lock:
-        selected = [name for name in _core._servers if scope is None or _core._server_scope_keys.get(name) == scope]
-        servers_snapshot = [_core._servers[name] for name in selected]
-        selected_status = (
-            set(_core._servers) | set(_core._server_scope_keys)
-            | set(_core._server_connecting) | set(_core._server_connect_errors)
-            if scope is None else {
-                name for name, owner in _core._server_scope_keys.items() if owner == scope
-            }
-        )
+        # Every per-route map (connection, ownership, connecting/error/retry/failure) is keyed by the
+        # SAME route identity now, so selection and clearing share one key set. Route-scoped teardown
+        # selects from OWNERSHIP + all connection-state maps INDEPENDENTLY of live _servers, so a
+        # failed/connecting route (no live server) still has its state cleared after /reload-mcp and
+        # does not block the next attempt. scope=None sweeps everything.
+        if scope is None:
+            selected_keys = (set(_core._servers) | set(_core._server_scope_keys)
+                             | set(_core._server_connecting) | set(_core._server_connect_errors)
+                             | set(_core._server_connect_retry_after) | set(_core._server_connect_failures))
+        else:
+            selected_keys = {k for k, owner in _core._server_scope_keys.items() if owner == scope}
+        selected = [k for k in selected_keys if k in _core._servers]
+        servers_snapshot = [_core._servers[key] for key in selected]
 
     def clear_selected_status():
-        _core._server_connecting.difference_update(selected_status)
-        for name in selected_status:
-            _core._server_connect_errors.pop(name, None)
-            _core._server_scope_keys.pop(name, None)
+        _core._server_connecting.difference_update(selected_keys)
+        for key in selected_keys:
+            _core._server_connect_errors.pop(key, None)
+            _core._server_scope_keys.pop(key, None)
 
     # Fast path: nothing to shut down. The connect-cooldown maps can still be populated here — a server that
     # failed to connect is never recorded in ``_servers`` (that is the very premise of the #50394 cooldown),
@@ -130,11 +134,10 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
                 if isinstance(result, Exception):
                     logger.debug("Error closing MCP server '%s': %s", server.name, result)
             with _core._lock:
-                for name in selected:
-                    _core._servers.pop(name, None)
-                    _core._server_scope_keys.pop(name, None)
+                for key in selected:
+                    _core._servers.pop(key, None)
                 clear_selected_status()
-                _clear_connect_cooldowns(None if scope is None else selected_status)
+                _clear_connect_cooldowns(None if scope is None else selected_keys)
 
         with _core._lock:
             loop = _core._mcp_loop
@@ -153,7 +156,7 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
     with _core._lock:
         if not servers_snapshot:
             clear_selected_status()
-        _clear_connect_cooldowns(None if scope is None else selected_status)
+        _clear_connect_cooldowns(None if scope is None else selected_keys)
     _loop._stop_mcp_loop(only_if_idle=scope is not None)
 
 

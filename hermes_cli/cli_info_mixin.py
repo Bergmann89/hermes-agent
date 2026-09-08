@@ -875,9 +875,11 @@ class CLIInfoMixin:
             from tools.mcp_tool_lifecycle import shutdown_mcp_servers
             from tools.mcp_tool_discovery import discover_mcp_tools
             from tools.mcp_tool_agent import reprobe_tool_availability
-            from tools.mcp_tool import _servers, _lock
+            from tools.mcp_tool import _servers, _lock, _key_name
             with _lock:
-                old_servers = set(_servers.keys())
+                # _servers keys are composite (name, fingerprint) tuples; project to plain NAMES
+                # for the added/removed/reconnected diff and its sorted join.
+                old_servers = {_key_name(k) for k in _servers}
             if not self._command_running:
                 print("🔄 Reloading MCP servers...")
 
@@ -886,7 +888,7 @@ class CLIInfoMixin:
             new_tools = discover_mcp_tools()  # reads config.yaml fresh
 
             with _lock:
-                connected_servers = set(_servers.keys())
+                connected_servers = {_key_name(k) for k in _servers}
             diff = {
                 "Added": connected_servers - old_servers,
                 "Removed": old_servers - connected_servers,

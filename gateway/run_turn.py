@@ -2271,17 +2271,19 @@ class GatewayTurnMixin:
         try:
             from tools.mcp_tool_lifecycle import shutdown_mcp_servers
             from tools.mcp_tool_discovery import discover_mcp_tools
-            from tools.mcp_tool import _servers, _lock, _server_scope_keys
+            from tools.mcp_tool import _servers, _lock, _server_scope_keys, _key_name
             from tools.mcp_tool_agent import reprobe_tool_availability
             from tools.registry import registry
 
             reload_scope = registry.current_scope_key() if multiplex else None
 
             def _scoped_server_names() -> set:
+                # _servers keys are composite (name, fingerprint) tuples; project them to plain server
+                # NAMES for display/join while comparing OWNERSHIP on the composite key.
                 with _lock:
                     return {
-                        name for name in _servers
-                        if reload_scope is None or _server_scope_keys.get(name) == reload_scope
+                        _key_name(key) for key in _servers
+                        if reload_scope is None or _server_scope_keys.get(key) == reload_scope
                     }
 
             old_servers = _scoped_server_names()

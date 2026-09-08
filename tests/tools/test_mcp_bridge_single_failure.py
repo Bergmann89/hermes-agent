@@ -90,9 +90,10 @@ class TestRegisterMcpServersIsolation:
                 patch("tools.mcp_tool_registration._register_server_tools", return_value=[]), \
                 patch("tools.mcp_tool_config._filter_suspicious_mcp_servers", side_effect=lambda x: x):
             _mcp_discovery.register_mcp_servers(cfg)
-            assert "good" in mcp_mod._servers
-            assert "bad" not in mcp_mod._servers
-            assert _mcp_discovery._connect_cooldown_active("bad") is True
+            assert mcp_mod._server_key("good", cfg["good"]) in mcp_mod._servers
+            assert mcp_mod._server_key("bad", cfg["bad"]) not in mcp_mod._servers
+            # Cooldown is keyed by the route identity (name, fingerprint).
+            assert _mcp_discovery._connect_cooldown_active(mcp_mod._server_key("bad", cfg["bad"])) is True
             assert "bad" in attempts
 
             attempts.clear()
@@ -109,9 +110,10 @@ class TestRegisterMcpServersIsolation:
                 patch("tools.mcp_tool_registration._register_server_tools", return_value=[]), \
                 patch("tools.mcp_tool_config._filter_suspicious_mcp_servers", side_effect=lambda x: x):
             _mcp_discovery.register_mcp_servers(cfg)
-            assert _mcp_discovery._connect_cooldown_active("bad") is True
+            bad_key = mcp_mod._server_key("bad", cfg["bad"])
+            assert _mcp_discovery._connect_cooldown_active(bad_key) is True
 
-            mcp_mod._server_connect_retry_after["bad"] = mcp_mod.time.monotonic() - 1
+            mcp_mod._server_connect_retry_after[bad_key] = mcp_mod.time.monotonic() - 1
             attempts.clear()
             _mcp_discovery.register_mcp_servers(cfg)
             assert "bad" in attempts, "elapsed cooldown should permit a retry"

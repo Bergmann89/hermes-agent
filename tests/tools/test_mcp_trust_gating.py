@@ -226,8 +226,10 @@ class TestAnnotationCaptureAtDiscovery:
              patch("tools.mcp_tool_registration._track_mcp_tool_server"):
             _mcp_registration._register_server_tools("srv", server, config)
 
-        assert mcp_tool._server_trust_levels["srv"] == "untrusted"
-        hints = mcp_tool._tool_read_only_hints["srv"]
+        # Trust/readOnlyHint are keyed by the route identity (name, fingerprint), not the bare name.
+        route_key = mcp_tool._server_key("srv", config)
+        assert mcp_tool._server_trust_levels[route_key] == "untrusted"
+        hints = mcp_tool._tool_read_only_hints[route_key]
         assert hints.get("list_repos") is True
         # Anything not exactly True is write-capable.
         assert not hints.get("delete_repo")

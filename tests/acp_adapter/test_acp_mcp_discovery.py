@@ -64,12 +64,13 @@ def _reset_mcp_startup_state():
     """Ensure each test starts with a clean discovery thread state."""
     saved_started = mcp_startup._mcp_discovery_started
     saved_thread = mcp_startup._mcp_discovery_thread
-    mcp_startup._mcp_discovery_started = False
-    mcp_startup._mcp_discovery_thread = None
+    # Per-home discovery bookkeeping is a set[str]/dict keyed by home_key.
+    mcp_startup._mcp_discovery_started = set()
+    mcp_startup._mcp_discovery_thread = {}
     yield
-    thread = mcp_startup._mcp_discovery_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=2.0)
+    for thread in list(mcp_startup._mcp_discovery_thread.values()):
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
     mcp_startup._mcp_discovery_started = saved_started
     mcp_startup._mcp_discovery_thread = saved_thread
 
@@ -113,10 +114,11 @@ def test_acp_background_discovery_does_not_block_startup(monkeypatch):
     elapsed = time.monotonic() - start
 
     assert elapsed < 0.2, "start_background_mcp_discovery blocked for {:.3f}s".format(elapsed)
-    assert mcp_startup._mcp_discovery_thread is not None
-    assert mcp_startup._mcp_discovery_thread.is_alive()
+    thread = next((t for t in threading.enumerate() if t.name == "test-acp-discovery"), None)
+    assert thread is not None
+    assert thread.is_alive()
     block.set()
-    mcp_startup._mcp_discovery_thread.join(timeout=2.0)
+    thread.join(timeout=2.0)
 
 
 # ---------------------------------------------------------------------------

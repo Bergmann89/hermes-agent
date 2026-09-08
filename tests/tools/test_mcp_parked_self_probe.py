@@ -31,7 +31,7 @@ def test_revival_discovery_registers_tools_while_ready_is_cleared(monkeypatch):
     )
     server._ready.clear()
     server._registered_tool_names = []
-    monkeypatch.setitem(mcp_tool._servers, server.name, server)
+    monkeypatch.setitem(mcp_tool._servers, mcp_tool._server_key(server.name, server._config), server)
 
     register = MagicMock(return_value=["srv__send_message"])
     monkeypatch.setattr(_mcp_registration, "_register_server_tools", register)

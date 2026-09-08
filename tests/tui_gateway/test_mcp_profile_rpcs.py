@@ -193,6 +193,12 @@ def test_status_includes_named_profile_runtime_in_multiplex(hermes_root):
     work_token = set_hermes_home_override(hermes_root / "profiles" / "work")
     try:
         work_scope = hermes_home_key()
+        # Seed under the SAME composite (name, fingerprint) key the status reader derives from
+        # work's loaded config: get_mcp_status resolves runtime by _server_key strictly (no bare
+        # fallback), so a bare "shared" seed would read as 'configured', not 'connected'.
+        from tools import mcp_tool_config
+        shared_cfg = mcp_tool_config._load_mcp_config()["shared"]
+        shared_key = mcp_tool._server_key("shared", shared_cfg)
     finally:
         reset_hermes_home_override(work_token)
 
@@ -206,8 +212,8 @@ def test_status_includes_named_profile_runtime_in_multiplex(hermes_root):
     with mcp_tool._lock:
         saved_servers = dict(mcp_tool._servers)
         saved_scopes = dict(mcp_tool._server_scope_keys)
-        mcp_tool._servers["shared"] = work_server  # type: ignore[assignment]
-        mcp_tool._server_scope_keys["shared"] = work_scope
+        mcp_tool._servers[shared_key] = work_server  # type: ignore[assignment]
+        mcp_tool._server_scope_keys[shared_key] = work_scope
 
     set_multiplex_active(True)
     try:
